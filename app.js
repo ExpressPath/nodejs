@@ -1,36 +1,106 @@
 const express = require('express');
-const path = require('path');
-const indexRouter = require('./routes/index');
+const { randomUUID } = require('node:crypto');
+const router = require('./routes/index');
+const config = require('./lib/config');
+const jobManager = require('./lib/job-manager');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-// Middleware: parse JSON bodies
-app.use(express.json());
+app.disable('x-powered-by');
+app.set('trust proxy', true);
 
-// Middleware: log request method and url
 app.use((req, res, next) => {
-  console.info(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  req.id = randomUUID();
+  req.startedAt = Date.now();
+  res.setHeader('X-Request-Id', req.id);
   next();
 });
 
-// Static files
-app.use(express.static(path.resolve(__dirname, 'public')));
+if (config.corsAllowOrigin) {
+  app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', config.corsAllowOrigin);
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Helper-Key, X-Request-Id');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
 
-// Main routes
-app.use('/', indexRouter);
+    if (config.corsAllowOrigin !== '*') {
+      res.setHeader('Vary', 'Origin');
+    }
 
-// 404 handler
+    if (req.method === 'OPTIONS') {
+      return res.status(204).end();
+    }
+
+    next();
+  });
+}
+
+app.use(express.json({ limit: config.jsonLimit }));
+app.use(express.urlencoded({ extended: true, limit: config.urlencodedLimit }));
+
+app.use((req, res, next) => {
+  res.on('finish', () => {
+    const durationMs = Date.now() - req.startedAt;
+    console.info(JSON.stringify({
+      level: 'info',
+      requestId: req.id,
+      method: req.method,
+      path: req.originalUrl,
+      statusCode: res.statusCode,
+      durationMs,
+      ip: req.ip,
+      userAgent: req.get('user-agent') || null
+    }));
+  });
+
+  next();
+});
+
+app.use('/', router);
+
 app.use((req, res) => {
-  res.status(404).sendFile(path.resolve(__dirname, 'views', '404.html'));
+  res.status(404).json({
+    success: false,
+    requestId: req.id,
+    error: 'Route not found'
+  });
 });
 
-// Error handler
 app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).send('Internal Server Error');
+  const statusCode = err.statusCode || 500;
+
+  console.error(JSON.stringify({
+    level: 'error',
+    requestId: req.id,
+    message: err.message,
+    stack: err.stack,
+    statusCode,
+    details: err.details || null
+  }));
+
+  res.status(statusCode).json({
+    success: false,
+    requestId: req.id,
+    error: err.message || 'Internal Server Error',
+    details: err.details || null
+  });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening: http://localhost:${PORT}`);
+jobManager.startMaintenance();
+jobManager.bootstrap().catch((error) => {
+  console.error(JSON.stringify({
+    level: 'error',
+    message: 'Failed to bootstrap job manager',
+    error: error.message,
+    stack: error.stack
+  }));
 });
+
+if (require.main === module) {
+  const server = app.listen(config.port, () => {
+    console.log(`${config.serviceName} listening on port ${config.port}`);
+  });
+
+  server.requestTimeout = config.httpRequestTimeoutMs;
+}
+
+module.exports = app;

@@ -1,14 +1,18 @@
 {
-  "name": "nodejs-app",
-  "version": "1.0.0",
-  "description": "A minimal Node.js web application.",
+  "name": "railway-helper-api",
+  "version": "1.3.0",
+  "description": "Railway helper API for proof checking and lambda conversion jobs.",
   "main": "app.js",
   "author": "codestorm",
   "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "express": "^5.1.0"
   },
   "scripts": {
-    "start": "node app.js"
+    "start": "node app.js",
+    "dev": "node --watch app.js"
   }
 }
