@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const config = require('../lib/config');
 const { requireHelperAuth } = require('../lib/auth');
 const { SUPPORTED_OPERATIONS, calculate } = require('../lib/calculator');
@@ -395,3 +395,4 @@ router.delete('/api/helper/jobs/:id', async (req, res, next) => {
 });
 
 module.exports = router;
+
