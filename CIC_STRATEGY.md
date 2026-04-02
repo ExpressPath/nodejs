@@ -62,7 +62,7 @@ This is useful because both ecosystems already have open-source translators ther
 - `tools/convert-lean.cjs` uses `#print` and `#check`
 - `tools/convert-coq.cjs` uses `Print` and `Check`
 - `tools/convert-lean-cic.cjs` now decodes `lean4export` NDJSON into a `cic-v1` JSON tree for a quotient-free fragment
-- `tools/convert-coq-cic.cjs` is currently an adapter wrapper around an exact external exporter command
+- `tools/convert-coq-cic.cjs` now includes a built-in MetaRocq Template export path for constants and still accepts an exact external exporter command
 - `lib/cic-normalizer.js` now normalizes both Lean- and Coq-side CIC payloads into one shared `cic-v1` schema
 
 These are helpful proof-term exports, but they are not exact CIC converters.

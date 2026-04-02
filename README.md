@@ -46,10 +46,10 @@ Important:
 
 - the bundled Docker image now builds `lean4export` and wires it into `tools/convert-lean-cic.cjs`
 - the bundled `tools/convert-lean-cic.cjs` uses `lake env <lean4export> <module>` and currently targets a quotient-free `cic-v1` fragment
-- the bundled `tools/convert-coq-cic.cjs` is a normalizing wrapper and still expects an exact external exporter command
+- the bundled Docker image now installs Rocq `9.1.x` plus `rocq-metarocq-template`
+- the bundled `tools/convert-coq-cic.cjs` now has a built-in MetaRocq export path and still accepts an external exact exporter via `COQ_CIC_EXPORT_CMD`
 - both Lean and Coq CIC paths are normalized through `lib/cic-normalizer.js` into the same `cic-v1` schema
 - normalized results now include `schemaVersion` and `metadata.normalization`
-- Coq `cic-v1` is intentionally not enabled by default until an exact exporter is configured
 - the bundled `tools/convert-lean.cjs` and `tools/convert-coq.cjs` are not exact CIC exporters
 - `format: "cic-v1"` should only be used when the CIC converters above are configured
 - see `CIC_STRATEGY.md` for the researched exact path
