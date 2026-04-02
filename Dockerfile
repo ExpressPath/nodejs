@@ -43,8 +43,11 @@ RUN apt-get update \
 USER opam
 RUN opam repo add -y rocq-released https://rocq-prover.org/opam/released
 RUN opam switch create ivucx 4.14.2
-RUN opam pin add -y --switch=ivucx rocq-prover 9.1.0
-RUN opam install -y --switch=ivucx rocq-metarocq-template
+RUN opam update --switch=ivucx
+RUN opam install -y --switch=ivucx \
+  rocq-prover \
+  rocq-core=9.1.1 \
+  rocq-metarocq-template=1.5.1+9.1
 
 FROM node:20-bookworm-slim
 
