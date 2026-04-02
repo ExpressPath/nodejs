@@ -24,6 +24,34 @@ If `LEAN_LAMBDA_CMD` / `COQ_LAMBDA_CMD` are not set, the server uses the bundled
 
 They use Lean / Coq themselves to print elaborated proof terms and normalize the result into a shared JSON envelope.
 
+## CIC direction
+
+This server can also be configured with exact-export commands for a `cic-v1` target.
+
+- `LEAN_CIC_CMD`
+- `LEAN_CIC_ARGS`
+- `LEAN_CIC_STDOUT_FORMAT`
+- `LEAN_CIC_RESULT_FORMAT`
+- `COQ_CIC_CMD`
+- `COQ_CIC_ARGS`
+- `COQ_CIC_STDOUT_FORMAT`
+- `COQ_CIC_RESULT_FORMAT`
+- `LEAN4EXPORT_CMD` or `IVUCX_LEAN_EXPORTER_CMD`
+- `LEAN4EXPORT_ARGS` or `IVUCX_LEAN_EXPORTER_ARGS`
+- `LEAN4EXPORT_BIN` or `IVUCX_LEAN_EXPORTER_BIN`
+- `COQ_CIC_EXPORT_CMD` or `IVUCX_COQ_CIC_EXPORT_CMD`
+- `COQ_CIC_EXPORT_ARGS` or `IVUCX_COQ_CIC_EXPORT_ARGS`
+
+Important:
+
+- the bundled Docker image now builds `lean4export` and wires it into `tools/convert-lean-cic.cjs`
+- the bundled `tools/convert-lean-cic.cjs` uses `lake env <lean4export> <module>` and currently targets a quotient-free `cic-v1` fragment
+- the bundled `tools/convert-coq-cic.cjs` is a normalizing wrapper and still expects an exact external exporter command
+- Coq `cic-v1` is intentionally not enabled by default until an exact exporter is configured
+- the bundled `tools/convert-lean.cjs` and `tools/convert-coq.cjs` are not exact CIC exporters
+- `format: "cic-v1"` should only be used when the CIC converters above are configured
+- see `CIC_STRATEGY.md` for the researched exact path
+
 ## Auth
 
 If `HELPER_API_KEY` is set, helper endpoints require one of the following.
@@ -46,6 +74,10 @@ docker run --rm -p 3000:3000 \
   -e HELPER_API_KEY=change-me \
   railway-helper-api
 ```
+
+You can also start from:
+
+- `.env.example`
 
 ## Example convert payload
 

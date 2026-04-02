@@ -31,6 +31,7 @@ function infoPayload() {
       proofCheck: true,
       submit: true,
       lambdaConvert: true,
+      cicConvert: true,
       jobs: true
     },
     routes: {

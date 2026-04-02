@@ -6,6 +6,7 @@ ENV PATH=/opt/elan/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
+    build-essential \
     ca-certificates \
     curl \
     git \
@@ -17,6 +18,10 @@ RUN apt-get update \
 RUN curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
     | sh -s -- -y --default-toolchain leanprover/lean4:stable --no-modify-path
 
+RUN git clone --depth=1 https://github.com/leanprover/lean4export /opt/lean4export \
+  && cd /opt/lean4export \
+  && lake build
+
 WORKDIR /app
 
 COPY package.json ./
@@ -26,12 +31,18 @@ COPY . .
 
 ENV NODE_ENV=production
 ENV PORT=3000
+ENV LEAN_TOOLCHAIN=leanprover/lean4:stable
 ENV LEAN_CMD=lean
 ENV COQ_CMD=coqc
 ENV LEAN_LAMBDA_CMD=node
 ENV LEAN_LAMBDA_ARGS="tools/convert-lean.cjs --out {out}"
 ENV COQ_LAMBDA_CMD=node
 ENV COQ_LAMBDA_ARGS="tools/convert-coq.cjs --out {out}"
+ENV LEAN_CIC_CMD=node
+ENV LEAN_CIC_ARGS="tools/convert-lean-cic.cjs --out {out}"
+ENV LEAN4EXPORT_BIN=/opt/lean4export/.lake/build/bin/lean4export
+ENV LEAN4EXPORT_CMD=lake
+ENV LEAN4EXPORT_ARGS="env {bin} {module}"
 
 EXPOSE 3000
 
