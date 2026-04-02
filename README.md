@@ -1,6 +1,9 @@
 # Railway Helper API
 
-This helper server accepts Lean and Coq proof-check requests and proof-term conversion requests from the main site.
+This helper server is intended to cooperate with the main `iVucx` app:
+
+- proof checking can be delegated to the Render-hosted `iVucx` deployment
+- conversion and submit jobs stay on the Railway helper
 
 ## What it does
 
@@ -14,6 +17,25 @@ This helper server accepts Lean and Coq proof-check requests and proof-term conv
 - `GET /api/helper/jobs/:id`
 - `GET /api/helper/jobs/:id/result`
 - `DELETE /api/helper/jobs/:id`
+
+`GET /api/helper/info` also exposes the supported async job types:
+
+- `proof-check`
+- `lambda-convert`
+- `submit`
+
+## Recommended deployment split
+
+- `Render` hosts `iVucx` itself and runs Lean / Coq proof checking
+- `Railway` hosts this helper and runs conversion, submission, and job storage
+
+When you set `EXECUTION_SERVER_BASE_URL`, point it at the public base URL of the Render-hosted `iVucx` app.
+
+Important:
+
+- the execution delegate is now `proof-check-only`
+- conversion is always executed locally on this helper
+- this avoids a `/api/helper/convert -> Render -> Railway -> Render` delegation loop
 
 ## Built-in converter commands
 

@@ -1,11 +1,42 @@
-﻿const express = require('express');
+const express = require('express');
 const config = require('../lib/config');
 const { requireHelperAuth } = require('../lib/auth');
 const { SUPPORTED_OPERATIONS, calculate } = require('../lib/calculator');
-const { performProofCheck, performLambdaConversion, getHelperInfo } = require('../lib/helper-service');
+const {
+  JOB_TYPE_CONVERT,
+  JOB_TYPE_PROOF_CHECK,
+  JOB_TYPE_SUBMIT,
+  getHelperInfo,
+  performLambdaConversion,
+  performProofCheck,
+  performSubmit
+} = require('../lib/helper-service');
 const jobManager = require('../lib/job-manager');
 
 const router = express.Router();
+
+const PUBLIC_ROUTES = {
+  root: '/',
+  health: '/healthz',
+  ready: '/readyz'
+};
+
+const HELPER_ROUTES = {
+  calculate: '/api/helper/calculate',
+  proofCheck: '/api/helper/check',
+  submit: '/api/helper/submit',
+  lambdaConvert: '/api/helper/convert',
+  createJob: '/api/helper/jobs',
+  getJob: '/api/helper/jobs/:id',
+  getJobResult: '/api/helper/jobs/:id/result',
+  deleteJob: '/api/helper/jobs/:id'
+};
+
+const JOB_TYPES = {
+  proofCheck: JOB_TYPE_PROOF_CHECK,
+  convert: JOB_TYPE_CONVERT,
+  submit: JOB_TYPE_SUBMIT
+};
 
 function healthPayload() {
   return {
@@ -35,18 +66,10 @@ function infoPayload() {
       jobs: true
     },
     routes: {
-      root: '/',
-      health: '/healthz',
-      ready: '/readyz',
-      calculate: '/api/helper/calculate',
-      proofCheck: '/api/helper/check',
-      submit: '/api/helper/submit',
-      lambdaConvert: '/api/helper/convert',
-      createJob: '/api/helper/jobs',
-      getJob: '/api/helper/jobs/:id',
-      getJobResult: '/api/helper/jobs/:id/result',
-      deleteJob: '/api/helper/jobs/:id'
+      ...PUBLIC_ROUTES,
+      ...HELPER_ROUTES
     },
+    jobTypes: JOB_TYPES,
     operations: SUPPORTED_OPERATIONS,
     jobs: {
       concurrency: config.jobConcurrency,
@@ -131,6 +154,61 @@ function statusCodeForResult(result) {
   return 422;
 }
 
+function sendResult(res, req, result) {
+  return res.status(statusCodeForResult(result)).json({
+    success: Boolean(result && result.ok),
+    requestId: req.id,
+    result
+  });
+}
+
+function sendAcceptedJob(res, req, job) {
+  return res.status(202).json({
+    success: true,
+    requestId: req.id,
+    job: summarizeJob(job, false)
+  });
+}
+
+function sendNotFound(res, req, message) {
+  return res.status(404).json({
+    success: false,
+    requestId: req.id,
+    error: message || 'Not found'
+  });
+}
+
+function buildJobMetadata(req) {
+  return {
+    requestId: req.id,
+    route: req.originalUrl
+  };
+}
+
+function wrapAsync(handler) {
+  return async (req, res, next) => {
+    try {
+      await handler(req, res, next);
+    } catch (error) {
+      next(error);
+    }
+  };
+}
+
+function createOperationHandler(options) {
+  return wrapAsync(async (req, res) => {
+    const payload = req.body || {};
+
+    if (shouldRunAsync(payload.async)) {
+      const job = await jobManager.createJob(options.jobType, payload, buildJobMetadata(req));
+      return sendAcceptedJob(res, req, job);
+    }
+
+    const result = await options.execute(payload);
+    return sendResult(res, req, result);
+  });
+}
+
 function handleCalculation(req, res, next) {
   try {
     const body = req.body || {};
@@ -148,7 +226,7 @@ function handleCalculation(req, res, next) {
   }
 }
 
-router.get('/', (req, res) => {
+router.get(PUBLIC_ROUTES.root, (req, res) => {
   res.json({
     success: true,
     requestId: req.id,
@@ -161,11 +239,11 @@ router.get('/health', (req, res) => {
   res.json(healthPayload());
 });
 
-router.get('/healthz', (req, res) => {
+router.get(PUBLIC_ROUTES.health, (req, res) => {
   res.json(healthPayload());
 });
 
-router.get('/readyz', (req, res) => {
+router.get(PUBLIC_ROUTES.ready, (req, res) => {
   res.json({
     ...healthPayload(),
     ready: true
@@ -174,7 +252,7 @@ router.get('/readyz', (req, res) => {
 
 router.post('/calculate', handleCalculation);
 router.use('/api/helper', requireHelperAuth);
-router.post('/api/helper/calculate', handleCalculation);
+router.post(HELPER_ROUTES.calculate, handleCalculation);
 
 router.get('/api/helper/info', (req, res) => {
   res.json({
@@ -184,215 +262,105 @@ router.get('/api/helper/info', (req, res) => {
   });
 });
 
-router.post('/api/helper/check', async (req, res, next) => {
-  try {
-    const payload = req.body || {};
+router.post('/api/helper/check', createOperationHandler({
+  jobType: JOB_TYPE_PROOF_CHECK,
+  execute: performProofCheck
+}));
 
-    if (shouldRunAsync(payload.async)) {
-      const job = await jobManager.createJob('proof-check', payload, {
-        requestId: req.id,
-        route: req.originalUrl
-      });
+router.post('/api/helper/convert', createOperationHandler({
+  jobType: JOB_TYPE_CONVERT,
+  execute: performLambdaConversion
+}));
 
-      return res.status(202).json({
-        success: true,
-        requestId: req.id,
-        job: summarizeJob(job, false)
-      });
-    }
+router.post('/api/helper/submit', createOperationHandler({
+  jobType: JOB_TYPE_SUBMIT,
+  execute: performSubmit
+}));
 
-    const result = await performProofCheck(payload);
-    return res.status(statusCodeForResult(result)).json({
-      success: result.ok,
-      requestId: req.id,
-      result
-    });
-  } catch (error) {
-    return next(error);
+router.post('/api/helper/jobs', wrapAsync(async (req, res) => {
+  const body = req.body || {};
+  const type = body.type;
+  const payload = body.payload || {};
+
+  if (!type) {
+    const error = new Error('type is required');
+    error.statusCode = 400;
+    throw error;
   }
-});
 
-router.post('/api/helper/convert', async (req, res, next) => {
-  try {
-    const payload = req.body || {};
+  const job = await jobManager.createJob(type, payload, buildJobMetadata(req));
+  return sendAcceptedJob(res, req, job);
+}));
 
-    if (shouldRunAsync(payload.async)) {
-      const job = await jobManager.createJob('lambda-convert', payload, {
-        requestId: req.id,
-        route: req.originalUrl
-      });
+router.get('/api/helper/jobs', wrapAsync(async (req, res) => {
+  const jobs = await jobManager.listJobs({
+    status: req.query.status,
+    type: req.query.type,
+    limit: req.query.limit
+  });
 
-      return res.status(202).json({
-        success: true,
-        requestId: req.id,
-        job: summarizeJob(job, false)
-      });
-    }
+  res.json({
+    success: true,
+    requestId: req.id,
+    jobs: jobs.map((job) => summarizeJob(job, false))
+  });
+}));
 
-    const result = await performLambdaConversion(payload);
-    return res.status(statusCodeForResult(result)).json({
-      success: result.ok,
-      requestId: req.id,
-      result
-    });
-  } catch (error) {
-    return next(error);
+router.get('/api/helper/jobs/:id', wrapAsync(async (req, res) => {
+  const job = await jobManager.getJob(req.params.id);
+  if (!job) {
+    return sendNotFound(res, req, 'Job not found');
   }
-});
 
-router.post('/api/helper/submit', async (req, res, next) => {
-  try {
-    const payload = req.body || {};
+  return res.json({
+    success: true,
+    requestId: req.id,
+    job: summarizeJob(job, true)
+  });
+}));
 
-    if (shouldRunAsync(payload.async)) {
-      const job = await jobManager.createJob('lambda-convert', payload, {
-        requestId: req.id,
-        route: req.originalUrl
-      });
-
-      return res.status(202).json({
-        success: true,
-        requestId: req.id,
-        job: summarizeJob(job, false)
-      });
-    }
-
-    const result = await performLambdaConversion(payload);
-    return res.status(statusCodeForResult(result)).json({
-      success: result.ok,
-      requestId: req.id,
-      result
-    });
-  } catch (error) {
-    return next(error);
+router.get('/api/helper/jobs/:id/result', wrapAsync(async (req, res) => {
+  const job = await jobManager.getJob(req.params.id);
+  if (!job) {
+    return sendNotFound(res, req, 'Job not found');
   }
-});
 
-router.post('/api/helper/jobs', async (req, res, next) => {
-  try {
-    const body = req.body || {};
-    const type = body.type;
-    const payload = body.payload || {};
-
-    if (!type) {
-      const error = new Error('type is required');
-      error.statusCode = 400;
-      throw error;
-    }
-
-    const job = await jobManager.createJob(type, payload, {
+  if (job.status !== 'succeeded') {
+    return res.status(409).json({
+      success: false,
       requestId: req.id,
-      route: req.originalUrl
-    });
-
-    res.status(202).json({
-      success: true,
-      requestId: req.id,
+      error: 'Job result is not ready',
       job: summarizeJob(job, false)
     });
-  } catch (error) {
-    next(error);
   }
-});
 
-router.get('/api/helper/jobs', async (req, res, next) => {
-  try {
-    const jobs = await jobManager.listJobs({
-      status: req.query.status,
-      type: req.query.type,
-      limit: req.query.limit
-    });
+  return res.json({
+    success: true,
+    requestId: req.id,
+    result: job.result
+  });
+}));
 
-    res.json({
-      success: true,
+router.delete('/api/helper/jobs/:id', wrapAsync(async (req, res) => {
+  const job = await jobManager.getJob(req.params.id);
+  if (!job) {
+    return sendNotFound(res, req, 'Job not found');
+  }
+
+  if (job.status === 'running' || job.status === 'queued') {
+    return res.status(409).json({
+      success: false,
       requestId: req.id,
-      jobs: jobs.map((job) => summarizeJob(job, false))
+      error: 'Cannot delete a queued or running job'
     });
-  } catch (error) {
-    next(error);
   }
-});
 
-router.get('/api/helper/jobs/:id', async (req, res, next) => {
-  try {
-    const job = await jobManager.getJob(req.params.id);
-    if (!job) {
-      return res.status(404).json({
-        success: false,
-        requestId: req.id,
-        error: 'Job not found'
-      });
-    }
-
-    return res.json({
-      success: true,
-      requestId: req.id,
-      job: summarizeJob(job, true)
-    });
-  } catch (error) {
-    return next(error);
-  }
-});
-
-router.get('/api/helper/jobs/:id/result', async (req, res, next) => {
-  try {
-    const job = await jobManager.getJob(req.params.id);
-    if (!job) {
-      return res.status(404).json({
-        success: false,
-        requestId: req.id,
-        error: 'Job not found'
-      });
-    }
-
-    if (job.status !== 'succeeded') {
-      return res.status(409).json({
-        success: false,
-        requestId: req.id,
-        error: 'Job result is not ready',
-        job: summarizeJob(job, false)
-      });
-    }
-
-    return res.json({
-      success: true,
-      requestId: req.id,
-      result: job.result
-    });
-  } catch (error) {
-    return next(error);
-  }
-});
-
-router.delete('/api/helper/jobs/:id', async (req, res, next) => {
-  try {
-    const job = await jobManager.getJob(req.params.id);
-    if (!job) {
-      return res.status(404).json({
-        success: false,
-        requestId: req.id,
-        error: 'Job not found'
-      });
-    }
-
-    if (job.status === 'running' || job.status === 'queued') {
-      return res.status(409).json({
-        success: false,
-        requestId: req.id,
-        error: 'Cannot delete a queued or running job'
-      });
-    }
-
-    await jobManager.deleteJob(req.params.id);
-    return res.json({
-      success: true,
-      requestId: req.id,
-      deleted: true
-    });
-  } catch (error) {
-    return next(error);
-  }
-});
+  await jobManager.deleteJob(req.params.id);
+  return res.json({
+    success: true,
+    requestId: req.id,
+    deleted: true
+  });
+}));
 
 module.exports = router;
-
