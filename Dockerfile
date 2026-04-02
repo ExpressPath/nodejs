@@ -41,8 +41,8 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 USER opam
-RUN opam repo add -y rocq-released https://rocq-prover.org/opam/released
 RUN opam switch create ivucx 4.14.2
+RUN opam repo add -y --switch=ivucx rocq-released https://rocq-prover.org/opam/released
 RUN opam update --switch=ivucx
 RUN opam install -y --switch=ivucx \
   rocq-prover \
