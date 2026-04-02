@@ -151,6 +151,63 @@ function extractCoqBody(printText) {
   return compact;
 }
 
+function escapeRegex(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function toCoqStringLiteral(value) {
+  return String(value || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"');
+}
+
+async function readTextIfExists(filePath) {
+  try {
+    return await fs.readFile(filePath, 'utf8');
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return '';
+    }
+    throw error;
+  }
+}
+
+function findCoqCheckLine(checkText, target) {
+  const rawText = String(checkText || '').trim();
+  if (!rawText) {
+    return '';
+  }
+
+  const candidates = [target.fullName, target.name]
+    .filter(Boolean)
+    .sort((left, right) => right.length - left.length);
+
+  const lines = rawText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  for (const line of [...lines].reverse()) {
+    for (const candidate of candidates) {
+      const linePattern = new RegExp(`^${escapeRegex(candidate)}(?:@\\{[^}]*\\})?\\s*:`);
+      if (linePattern.test(line)) {
+        return line;
+      }
+    }
+  }
+
+  const flattened = normalizeCommonText(rawText);
+  for (const candidate of candidates) {
+    const flattenedPattern = new RegExp(`${escapeRegex(candidate)}(?:@\\{[^}]*\\})?\\s*:\\s*([\\s\\S]+)$`);
+    const match = flattened.match(flattenedPattern);
+    if (match) {
+      return `${candidate} : ${match[1].trim()}`;
+    }
+  }
+
+  return '';
+}
+
 async function main() {
   const { flags, positional } = parseCliArgs(process.argv.slice(2));
   const sourcePath = positional[0];
@@ -172,14 +229,16 @@ async function main() {
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ivucx-coq-export-'));
   const exportPath = path.join(tempDir, path.basename(sourcePath));
+  const printCaptureBase = path.join(tempDir, 'ivucx_print');
+  const checkCaptureBase = path.join(tempDir, 'ivucx_check');
   const exportSource = [
     sourceText,
     '',
     'Set Printing All.',
     'Set Printing Universes.',
     'Set Printing Width 1000000.',
-    `Print ${target.fullName}.`,
-    `Check ${target.fullName}.`,
+    `Redirect "${toCoqStringLiteral(printCaptureBase)}" Print ${target.fullName}.`,
+    `Redirect "${toCoqStringLiteral(checkCaptureBase)}" Check ${target.fullName}.`,
     ''
   ].join('\n');
 
@@ -198,16 +257,22 @@ async function main() {
       throw buildError('Coq converter failed', result);
     }
 
+    const redirectedPrintText = (await readTextIfExists(`${printCaptureBase}.out`)).trim();
+    const redirectedCheckText = (await readTextIfExists(`${checkCaptureBase}.out`)).trim();
     const stdout = String(result.stdout || '').trim();
-    const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    const checkLine = [...lines].reverse().find((line) => line.startsWith(`${target.name} :`) || line.startsWith(`${target.fullName} :`));
+    const stderr = String(result.stderr || '').trim();
+    const combinedOutput = [stdout, stderr].filter(Boolean).join('\n').trim();
+    const checkLine = findCoqCheckLine(redirectedCheckText || combinedOutput, target);
 
     if (!checkLine) {
-      throw buildError('Coq converter did not emit a recognizable Check line', result);
+      throw buildError('Coq converter did not emit a recognizable Check line', {
+        ...result,
+        redirectedPrintText,
+        redirectedCheckText
+      });
     }
 
-    const checkIndex = stdout.lastIndexOf(checkLine);
-    const printText = stdout.slice(0, checkIndex).trim();
+    const printText = redirectedPrintText || stdout;
     const bodyText = extractCoqBody(printText);
     const typeText = extractCoqType(checkLine);
 
