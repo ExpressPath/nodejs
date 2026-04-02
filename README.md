@@ -69,6 +69,7 @@ Important:
 - the bundled Docker image now builds `lean4export` and wires it into `tools/convert-lean-cic.cjs`
 - the bundled `tools/convert-lean-cic.cjs` uses `lake env <lean4export> <module>` and currently targets a quotient-free `cic-v1` fragment
 - the bundled Docker image now installs Rocq `9.1.1` plus `rocq-metarocq-template 1.5.1+9.1`
+- the MetaRocq builder stage includes native build dependencies for Rocq packages and now runs `opam install --verbose` to surface package-solver or build failures in Railway logs
 - the bundled `tools/convert-coq-cic.cjs` now has a built-in MetaRocq export path and still accepts an external exact exporter via `COQ_CIC_EXPORT_CMD`
 - both Lean and Coq CIC paths are normalized through `lib/cic-normalizer.js` into the same `cic-v1` schema
 - normalized results now include `schemaVersion` and `metadata.normalization`

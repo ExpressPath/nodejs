@@ -33,10 +33,15 @@ USER root
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     bubblewrap \
+    build-essential \
     ca-certificates \
     git \
+    libgmp-dev \
     m4 \
+    patch \
     pkg-config \
+    rsync \
+    unzip \
     zstd \
   && rm -rf /var/lib/apt/lists/*
 
@@ -44,7 +49,7 @@ USER opam
 RUN opam switch create ivucx 4.14.2
 RUN opam repo add -y --switch=ivucx rocq-released https://rocq-prover.org/opam/released
 RUN opam update --switch=ivucx
-RUN opam install -y --switch=ivucx \
+RUN opam install -y --verbose --switch=ivucx \
   rocq-prover \
   rocq-core=9.1.1 \
   rocq-metarocq-template=1.5.1+9.1
