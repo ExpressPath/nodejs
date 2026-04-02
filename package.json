@@ -1,6 +1,6 @@
 {
   "name": "railway-helper-api",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Railway helper API for proof checking and lambda conversion jobs.",
   "main": "app.js",
   "author": "codestorm",
