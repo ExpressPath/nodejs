@@ -63,5 +63,40 @@ This is useful because both ecosystems already have open-source translators ther
 - `tools/convert-coq.cjs` uses `Print` and `Check`
 - `tools/convert-lean-cic.cjs` now decodes `lean4export` NDJSON into a `cic-v1` JSON tree for a quotient-free fragment
 - `tools/convert-coq-cic.cjs` is currently an adapter wrapper around an exact external exporter command
+- `lib/cic-normalizer.js` now normalizes both Lean- and Coq-side CIC payloads into one shared `cic-v1` schema
 
 These are helpful proof-term exports, but they are not exact CIC converters.
+
+## Shared normalized schema
+
+The current common target is a JSON `cic-v1` envelope with:
+
+- `format`
+- `schemaVersion`
+- `theoremName`
+- `term`
+- `context`
+- `declarations`
+- `metadata.normalization`
+
+The normalized term layer currently understands these common constructors:
+
+- `rel`
+- `var`
+- `sort`
+- `const`
+- `ind`
+- `construct`
+- `app`
+- `lambda`
+- `prod`
+- `let`
+- `cast`
+- `proj`
+- `case`
+- `fix`
+- `cofix`
+- `evar`
+- `lit`
+
+If an upstream exporter uses a constructor that is not mapped yet, the normalizer preserves it as `raw` / `raw-level` / `raw-text` and records counts in `metadata.normalization`.

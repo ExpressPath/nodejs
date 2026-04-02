@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { normalizeCicExport } = require('../lib/cic-normalizer');
 const {
   buildError,
   parseCliArgs,
@@ -116,12 +117,11 @@ async function runExternalCoqExporter(sourcePath, outPath) {
   const term = structured.term || structured.expression || structured.pcuic || structured.cic || structured.ast || null;
   const context = structured.context || (structured.type ? { type: structured.type } : null);
 
-  if (!term) {
-    throw buildError('Coq CIC exporter JSON did not contain a term payload');
+  if (!term && !(context && context.type)) {
+    throw buildError('Coq CIC exporter JSON did not contain a term or type payload');
   }
 
-  await writeJson(outPath, {
-    format: 'cic-v1',
+  await writeJson(outPath, normalizeCicExport({
     theoremName,
     term,
     context,
@@ -137,7 +137,13 @@ async function runExternalCoqExporter(sourcePath, outPath) {
       },
       upstreamMetadata: structured.metadata || null
     }
-  });
+  }, {
+    sourceLanguage: 'Coq',
+    sourceEncoding: structured.metadata && structured.metadata.extraction
+      ? structured.metadata.extraction
+      : 'external-coq-cic-exporter',
+    theoremName
+  }));
 }
 
 async function main() {

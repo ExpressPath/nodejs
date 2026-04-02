@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { normalizeCicExport } = require('../lib/cic-normalizer');
 const {
   buildError,
   parseCliArgs,
@@ -529,8 +530,7 @@ async function main() {
     throw buildError('Lean CIC exporter detected quotient-based features that are outside the current cic-v1 fragment');
   }
 
-  await writeJson(outPath, {
-    format: 'cic-v1',
+  await writeJson(outPath, normalizeCicExport({
     theoremName,
     term: valueExpr,
     context: {
@@ -546,9 +546,14 @@ async function main() {
         command: exportResult.command,
         args: exportResult.args
       },
-      meta: state.meta || null
+      meta: state.meta || null,
+      exactFragment: 'quotient-free'
     }
-  });
+  }, {
+    sourceLanguage: 'Lean',
+    sourceEncoding: 'lean4export-ndjson',
+    theoremName
+  }));
 }
 
 main().catch(async (error) => {
