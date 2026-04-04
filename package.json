@@ -1,18 +1,18 @@
-{
-  "name": "railway-helper-api",
-  "version": "1.6.0",
-  "description": "Railway helper API for proof checking and lambda conversion jobs.",
+﻿{
+  "name": "ivucx-railway-helper",
+  "version": "1.7.0",
+  "private": true,
+  "type": "module",
   "main": "app.js",
-  "author": "codestorm",
-  "license": "Apache-2.0",
-  "engines": {
-    "node": ">=18"
+  "description": "Railway planner/orchestrator for Supabase-backed proof conversion jobs.",
+  "scripts": {
+    "start": "node app.js"
   },
   "dependencies": {
-    "express": "^5.1.0"
+    "@supabase/supabase-js": "^2.50.2",
+    "express": "^4.19.2"
   },
-  "scripts": {
-    "start": "node app.js",
-    "dev": "node --watch app.js"
+  "engines": {
+    "node": ">=20.0.0"
   }
 }
