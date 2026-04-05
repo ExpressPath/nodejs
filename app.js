@@ -7,7 +7,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const MAX_CODE_BYTES = Number(process.env.HELPER_MAX_CODE_BYTES || 200000);
 const SERVICE_NAME = String(process.env.SERVICE_NAME || 'ivucx-railway-helper').trim() || 'ivucx-railway-helper';
-const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.6').trim() || '1.7.6';
+const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.7').trim() || '1.7.7';
 
 const HELPER_API_KEY = String(process.env.HELPER_API_KEY || '').trim();
 const EXECUTION_SERVER_BASE_URL = String(process.env.EXECUTION_SERVER_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -77,6 +77,15 @@ app.use((req, res, next) => {
   }
 
   next();
+});
+
+app.get('/', (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: SERVICE_NAME,
+    version: SERVICE_VERSION,
+    routes: ['/healthz', '/api/helper/info', '/api/helper/schema-check']
+  });
 });
 
 app.use((req, res, next) => {
