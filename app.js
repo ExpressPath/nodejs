@@ -1042,7 +1042,7 @@ function hydrateJobRow(row) {
 async function persistJob(job) {
   const { client } = getSupabaseAdmin();
   if (!client) return;
-  await client.from('helper_jobs').upsert({
+  const { error } = await client.from('helper_jobs').upsert({
     id: job.id,
     status: job.status,
     operation: job.operation || 'convert',
@@ -1063,6 +1063,11 @@ async function persistJob(job) {
     started_at: job.startedAt,
     completed_at: job.completedAt
   });
+  if (error) {
+    const writeError = new Error(`Failed to persist helper_jobs row: ${error.message || 'unknown Supabase error'}`);
+    writeError.statusCode = 502;
+    throw writeError;
+  }
 }
 
 async function getPlan(id) {
@@ -1114,7 +1119,7 @@ function hydratePlanRow(row) {
 async function persistPlan(plan) {
   const { client } = getSupabaseAdmin();
   if (!client) return;
-  await client.from('helper_conversion_plans').upsert({
+  const { error } = await client.from('helper_conversion_plans').upsert({
     id: plan.id,
     helper_job_id: plan.helperJobId || null,
     operation: plan.operation || 'convert',
@@ -1140,6 +1145,13 @@ async function persistPlan(plan) {
     started_at: plan.startedAt,
     completed_at: plan.completedAt
   });
+  if (error) {
+    const writeError = new Error(
+      `Failed to persist helper_conversion_plans row: ${error.message || 'unknown Supabase error'}`
+    );
+    writeError.statusCode = 502;
+    throw writeError;
+  }
 }
 
 function stripLeanCommentsAndStrings(input) {
