@@ -74,11 +74,17 @@ app.get('/healthz', (_req, res) => {
 
 app.get('/api/helper/info', (_req, res) => {
   const supabase = getSupabaseAdmin();
+  const supabaseEnv = resolveSupabaseEnv();
   res.status(200).json({
     ok: true,
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
     supabaseConfigured: !!supabase.client,
+    supabaseEnv: {
+      urlConfigured: !!supabaseEnv.url,
+      serviceRoleConfigured: !!supabaseEnv.serviceRoleKey,
+      anonConfigured: !!supabaseEnv.anonKey
+    },
     executionConfigured: !!EXECUTION_SERVER_BASE_URL,
     roles: getRoleInfo(),
     capabilities: {
@@ -222,11 +228,61 @@ function getExecutionInfo() {
   };
 }
 
+function firstNonEmpty(values) {
+  for (const value of values) {
+    const normalized = typeof value === 'string' ? value.trim() : '';
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return '';
+}
+
+function resolveSupabaseEnv() {
+  const url = firstNonEmpty([
+    process.env.NEXT_PUBLIC_SUPABASE_URL,
+    process.env.SUPABASE_URL,
+    process.env.PUBLIC_SUPABASE_URL,
+    process.env.VITE_SUPABASE_URL
+  ]);
+  const serviceRoleKey = firstNonEmpty([
+    process.env.SUPABASE_SERVICE_ROLE_KEY,
+    process.env.SUPABASE_SERVICE_KEY,
+    process.env.SUPABASE_SERVICE_ROLE,
+    process.env.SUPABASE_SECRET_KEY
+  ]);
+  const anonKey = firstNonEmpty([
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    process.env.SUPABASE_ANON_KEY,
+    process.env.VITE_SUPABASE_ANON_KEY
+  ]);
+
+  return {
+    url,
+    serviceRoleKey,
+    anonKey
+  };
+}
+
 function getSupabaseAdmin() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const { url, serviceRoleKey, anonKey } = resolveSupabaseEnv();
   if (!url || !serviceRoleKey) {
-    return { client: null, error: 'Supabase environment variables are missing.' };
+    const missing = [];
+    if (!url) {
+      missing.push('NEXT_PUBLIC_SUPABASE_URL (or SUPABASE_URL)');
+    }
+    if (!serviceRoleKey) {
+      missing.push('SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SERVICE_KEY)');
+    }
+
+    const anonNote = anonKey
+      ? ' A public anon key is present, but helper planning still requires a server-side service-role key.'
+      : ' BlueMode UI may expose only public values; the helper still requires a server-side service-role key.';
+
+    return {
+      client: null,
+      error: `Supabase environment variables are missing. Set ${missing.join(' and ')}.${anonNote}`
+    };
   }
   if (!supabaseClient) {
     supabaseClient = createClient(url, serviceRoleKey, {
