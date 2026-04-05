@@ -7,7 +7,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const MAX_CODE_BYTES = Number(process.env.HELPER_MAX_CODE_BYTES || 200000);
 const SERVICE_NAME = String(process.env.SERVICE_NAME || 'ivucx-railway-helper').trim() || 'ivucx-railway-helper';
-const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.3').trim() || '1.7.3';
+const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.5').trim() || '1.7.5';
 
 const HELPER_API_KEY = String(process.env.HELPER_API_KEY || '').trim();
 const EXECUTION_SERVER_BASE_URL = String(process.env.EXECUTION_SERVER_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -218,7 +218,21 @@ app.delete('/api/helper/jobs/:id', async (req, res) => {
   jobs.delete(job.id);
   const { client } = getSupabaseAdmin();
   if (client) {
-    await client.from('helper_jobs').delete().eq('id', job.id);
+    const { error } = await client.from('helper_jobs').delete().eq('id', job.id);
+    if (error && !shouldFallbackForMissingTable(error, 'helper_jobs')) {
+      if (isMissingSupabaseRelationError(error, 'helper_jobs')) {
+        res.status(503).json({
+          ok: false,
+          error: createMissingSupabaseTableError('helper_jobs', error).message
+        });
+        return;
+      }
+      res.status(502).json({
+        ok: false,
+        error: error.message || 'Failed to delete helper job row.'
+      });
+      return;
+    }
   }
   res.status(200).json({ ok: true, removed: true, jobId: job.id });
 });
@@ -1164,13 +1178,17 @@ async function updatePlanProgress(planId, status, progress) {
 async function getJob(id) {
   const memory = jobs.get(id);
   if (memory) return memory;
-  return loadPersistedJob(id);
+  const persisted = await loadPersistedJob(id);
+  if (persisted) {
+    return persisted;
+  }
+  return loadSynthesizedJobFromPlan(id);
 }
 
 async function listJobs() {
   const { client } = getSupabaseAdmin();
   if (!client) {
-    return Array.from(jobs.values()).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    return listMemoryAndPlanJobs();
   }
   const { data, error } = await client
     .from('helper_jobs')
@@ -1178,15 +1196,32 @@ async function listJobs() {
     .order('created_at', { ascending: false })
     .limit(100);
   if (error && shouldFallbackForMissingTable(error, 'helper_jobs')) {
-    return Array.from(jobs.values()).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    return listMemoryAndPlanJobs();
   }
   if (error && isMissingSupabaseRelationError(error, 'helper_jobs')) {
     throw createMissingSupabaseTableError('helper_jobs', error);
   }
   if (error) {
-    return Array.from(jobs.values()).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+    return listMemoryAndPlanJobs();
   }
   return Array.isArray(data) ? data.map(hydrateJobRow) : [];
+}
+
+function listMemoryAndPlanJobs() {
+  const merged = new Map();
+
+  for (const [jobId, job] of jobs.entries()) {
+    merged.set(jobId, job);
+  }
+
+  for (const plan of plans.values()) {
+    const synthesized = synthesizeJobFromPlan(plan);
+    if (synthesized && !merged.has(synthesized.id)) {
+      merged.set(synthesized.id, synthesized);
+    }
+  }
+
+  return Array.from(merged.values()).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
 }
 
 async function loadPersistedJob(id) {
@@ -1207,6 +1242,83 @@ async function loadPersistedJob(id) {
   const job = hydrateJobRow(data);
   jobs.set(job.id, job);
   return job;
+}
+
+async function loadSynthesizedJobFromPlan(jobId) {
+  if (!jobId) {
+    return null;
+  }
+
+  const memoryPlan = Array.from(plans.values()).find((plan) => plan && plan.helperJobId === jobId);
+  if (memoryPlan) {
+    return synthesizeJobFromPlan(memoryPlan, jobId);
+  }
+
+  const { client } = getSupabaseAdmin();
+  if (!client) {
+    return null;
+  }
+
+  const { data, error } = await client
+    .from('helper_conversion_plans')
+    .select('*')
+    .eq('helper_job_id', jobId)
+    .maybeSingle();
+
+  if (error && shouldFallbackForMissingTable(error, 'helper_conversion_plans')) {
+    return null;
+  }
+  if (error && isMissingSupabaseRelationError(error, 'helper_conversion_plans')) {
+    throw createMissingSupabaseTableError('helper_conversion_plans', error);
+  }
+  if (error || !data) {
+    return null;
+  }
+
+  const plan = hydratePlanRow(data);
+  plans.set(plan.id, plan);
+  return synthesizeJobFromPlan(plan, jobId);
+}
+
+function synthesizeJobFromPlan(plan, jobId = null) {
+  if (!plan || typeof plan !== 'object') {
+    return null;
+  }
+
+  const result = plan.executionResult && typeof plan.executionResult === 'object'
+    ? plan.executionResult
+    : null;
+  const error = plan.executionError && typeof plan.executionError === 'object'
+    ? plan.executionError
+    : null;
+
+  let status = JOB_STATUS.QUEUED;
+  if (plan.status === PLAN_STATUS.RUNNING || plan.status === PLAN_STATUS.READY || plan.status === PLAN_STATUS.PLANNING) {
+    status = JOB_STATUS.RUNNING;
+  } else if (plan.status === PLAN_STATUS.SUCCEEDED) {
+    status = JOB_STATUS.SUCCEEDED;
+  } else if (plan.status === PLAN_STATUS.FAILED) {
+    status = JOB_STATUS.FAILED;
+  }
+
+  return {
+    id: jobId || plan.helperJobId || plan.id,
+    status,
+    operation: plan.operation || 'convert',
+    title: plan.title || '',
+    language: plan.language || 'Lean',
+    fileName: plan.fileName || defaultFileName(plan.language || 'Lean'),
+    format: plan.requestedFormat || 'typed-lambda-v1',
+    sourceSha256: plan.sourceSha256 || '',
+    createdAt: plan.createdAt || nowIso(),
+    startedAt: plan.startedAt || null,
+    completedAt: plan.completedAt || null,
+    progress: plan.progress || null,
+    result: status === JOB_STATUS.SUCCEEDED ? result : null,
+    error: status === JOB_STATUS.FAILED ? error : null,
+    problemId: plan.problemId || null,
+    planId: plan.id
+  };
 }
 function hydrateJobRow(row) {
   return {
@@ -1541,7 +1653,8 @@ async function recoverStaleJobs() {
         completed_at: now
       })
       .in('status', [JOB_STATUS.QUEUED, JOB_STATUS.RUNNING]);
-    if (jobsRecovery.error && isMissingSupabaseRelationError(jobsRecovery.error, 'helper_jobs')) {
+    if (!(jobsRecovery.error && shouldFallbackForMissingTable(jobsRecovery.error, 'helper_jobs'))
+      && jobsRecovery.error && isMissingSupabaseRelationError(jobsRecovery.error, 'helper_jobs')) {
       throw createMissingSupabaseTableError('helper_jobs', jobsRecovery.error);
     }
 
@@ -1555,7 +1668,8 @@ async function recoverStaleJobs() {
         completed_at: now
       })
       .in('status', [PLAN_STATUS.QUEUED, PLAN_STATUS.PLANNING, PLAN_STATUS.READY, PLAN_STATUS.RUNNING]);
-    if (plansRecovery.error && isMissingSupabaseRelationError(plansRecovery.error, 'helper_conversion_plans')) {
+    if (!(plansRecovery.error && shouldFallbackForMissingTable(plansRecovery.error, 'helper_conversion_plans'))
+      && plansRecovery.error && isMissingSupabaseRelationError(plansRecovery.error, 'helper_conversion_plans')) {
       throw createMissingSupabaseTableError('helper_conversion_plans', plansRecovery.error);
     }
   } catch (err) {
