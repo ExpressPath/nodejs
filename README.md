@@ -73,3 +73,4 @@ This now creates:
 - Jobs keep progress metadata so the UI can show short real-time status text.
 - BlueMode client UI may expose only public values like `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY`.
 - The helper planner still needs a server-side service-role key and cannot bootstrap that key from browser state.
+- If `helper_conversion_plans` is missing, the helper now falls back to in-memory planning for the current process, but durable planning still requires the SQL schema.

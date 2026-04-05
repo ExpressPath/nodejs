@@ -39,7 +39,12 @@ const REQUIRED_SUPABASE_TABLES = Object.freeze([
   'problems'
 ]);
 
+const ENABLE_MEMORY_SCHEMA_FALLBACK = !['0', 'false', 'no', 'off'].includes(
+  String(process.env.HELPER_MEMORY_SCHEMA_FALLBACK || 'true').trim().toLowerCase()
+);
+
 const jobs = new Map();
+const plans = new Map();
 let supabaseClient = null;
 
 app.disable('x-powered-by');
@@ -100,6 +105,7 @@ app.get('/api/helper/info', (_req, res) => {
       cicConvert: true,
       planState: true,
       schemaCheck: true,
+      memorySchemaFallback: ENABLE_MEMORY_SCHEMA_FALLBACK,
       asyncJobs: true
     },
     routes: [
@@ -115,7 +121,9 @@ app.get('/api/helper/info', (_req, res) => {
     ],
     runtimes: {
       executionModel: {
-        stateStore: supabase.client ? 'supabase' : 'memory',
+        stateStore: supabase.client
+          ? (ENABLE_MEMORY_SCHEMA_FALLBACK ? 'supabase-with-memory-fallback' : 'supabase')
+          : 'memory',
         planning: 'railway',
         proofCheck: EXECUTION_SERVER_BASE_URL ? 'render' : 'unconfigured',
         conversion: EXECUTION_SERVER_BASE_URL ? 'render' : 'unconfigured'
@@ -280,6 +288,10 @@ function createMissingSupabaseTableError(tableName, error) {
     supabaseMessage: extractSupabaseErrorMessage(error) || null
   };
   return missing;
+}
+
+function shouldFallbackForMissingTable(error, tableName) {
+  return ENABLE_MEMORY_SCHEMA_FALLBACK && isMissingSupabaseRelationError(error, tableName);
 }
 
 function firstNonEmpty(values) {
@@ -961,6 +973,9 @@ async function saveProblemRecord(plan, result, proofState, completedFormat) {
     .single();
 
   if (insertError) {
+    if (isMissingSupabaseRelationError(insertError, 'problems')) {
+      throw createMissingSupabaseTableError('problems', insertError);
+    }
     throw new Error(insertError.message || 'Failed to save problem row.');
   }
 
@@ -1095,6 +1110,9 @@ async function listJobs() {
     .select('*')
     .order('created_at', { ascending: false })
     .limit(100);
+  if (error && shouldFallbackForMissingTable(error, 'helper_jobs')) {
+    return Array.from(jobs.values()).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  }
   if (error && isMissingSupabaseRelationError(error, 'helper_jobs')) {
     throw createMissingSupabaseTableError('helper_jobs', error);
   }
@@ -1112,6 +1130,9 @@ async function loadPersistedJob(id) {
     .select('*')
     .eq('id', id)
     .maybeSingle();
+  if (error && shouldFallbackForMissingTable(error, 'helper_jobs')) {
+    return jobs.get(id) || null;
+  }
   if (error && isMissingSupabaseRelationError(error, 'helper_jobs')) {
     throw createMissingSupabaseTableError('helper_jobs', error);
   }
@@ -1143,7 +1164,10 @@ function hydrateJobRow(row) {
 
 async function persistJob(job) {
   const { client } = getSupabaseAdmin();
-  if (!client) return;
+  if (!client) {
+    jobs.set(job.id, { ...job });
+    return;
+  }
   const { error } = await client.from('helper_jobs').upsert({
     id: job.id,
     status: job.status,
@@ -1166,6 +1190,10 @@ async function persistJob(job) {
     completed_at: job.completedAt
   });
   if (error) {
+    if (shouldFallbackForMissingTable(error, 'helper_jobs')) {
+      jobs.set(job.id, { ...job });
+      return;
+    }
     if (isMissingSupabaseRelationError(error, 'helper_jobs')) {
       throw createMissingSupabaseTableError('helper_jobs', error);
     }
@@ -1177,6 +1205,8 @@ async function persistJob(job) {
 
 async function getPlan(id) {
   if (!id) return null;
+  const memory = plans.get(id);
+  if (memory) return memory;
   return loadPersistedPlan(id);
 }
 
@@ -1188,6 +1218,9 @@ async function loadPersistedPlan(id) {
     .select('*')
     .eq('id', id)
     .maybeSingle();
+  if (error && shouldFallbackForMissingTable(error, 'helper_conversion_plans')) {
+    return plans.get(id) || null;
+  }
   if (error && isMissingSupabaseRelationError(error, 'helper_conversion_plans')) {
     throw createMissingSupabaseTableError('helper_conversion_plans', error);
   }
@@ -1226,7 +1259,22 @@ function hydratePlanRow(row) {
 
 async function persistPlan(plan) {
   const { client } = getSupabaseAdmin();
-  if (!client) return;
+  if (!client) {
+    const memoryPlan = {
+      ...plan,
+      plan: {
+        ...(plan.plan || {}),
+        stateStore: 'memory'
+      },
+      requestMeta: {
+        ...(plan.requestMeta || {}),
+        schemaFallback: 'supabase-unconfigured'
+      }
+    };
+    Object.assign(plan, memoryPlan);
+    plans.set(plan.id, memoryPlan);
+    return;
+  }
   const { error } = await client.from('helper_conversion_plans').upsert({
     id: plan.id,
     helper_job_id: plan.helperJobId || null,
@@ -1254,6 +1302,22 @@ async function persistPlan(plan) {
     completed_at: plan.completedAt
   });
   if (error) {
+    if (shouldFallbackForMissingTable(error, 'helper_conversion_plans')) {
+      const memoryPlan = {
+        ...plan,
+        plan: {
+          ...(plan.plan || {}),
+          stateStore: 'memory'
+        },
+        requestMeta: {
+          ...(plan.requestMeta || {}),
+          schemaFallback: 'helper_conversion_plans'
+        }
+      };
+      Object.assign(plan, memoryPlan);
+      plans.set(plan.id, memoryPlan);
+      return;
+    }
     if (isMissingSupabaseRelationError(error, 'helper_conversion_plans')) {
       throw createMissingSupabaseTableError('helper_conversion_plans', error);
     }
