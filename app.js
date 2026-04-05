@@ -7,7 +7,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const MAX_CODE_BYTES = Number(process.env.HELPER_MAX_CODE_BYTES || 200000);
 const SERVICE_NAME = String(process.env.SERVICE_NAME || 'ivucx-railway-helper').trim() || 'ivucx-railway-helper';
-const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.7').trim() || '1.7.7';
+const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.8').trim() || '1.7.8';
 
 const HELPER_API_KEY = String(process.env.HELPER_API_KEY || '').trim();
 const EXECUTION_SERVER_BASE_URL = String(process.env.EXECUTION_SERVER_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -46,6 +46,28 @@ const REQUIRED_SUPABASE_TABLES = Object.freeze([
   'helper_conversion_plans',
   'problems'
 ]);
+
+const REQUIRED_SUPABASE_COLUMNS = Object.freeze({
+  helper_jobs: ['id', 'status', 'operation', 'progress', 'plan_id'],
+  helper_conversion_plans: ['id', 'helper_job_id', 'operation', 'execution_payload', 'request_meta'],
+  problems: [
+    'id',
+    'title',
+    'language',
+    'file_name',
+    'source_code',
+    'source_sha256',
+    'proof_state',
+    'verification_status',
+    'verification_result',
+    'normalized_format',
+    'normalized_term',
+    'adapter_name',
+    'adapter_meta',
+    'helper_job_id',
+    'request_meta'
+  ]
+});
 
 const ENABLE_MEMORY_SCHEMA_FALLBACK = !['0', 'false', 'no', 'off'].includes(
   String(process.env.HELPER_MEMORY_SCHEMA_FALLBACK || 'true').trim().toLowerCase()
@@ -369,11 +391,32 @@ function isMissingSupabaseRelationError(error, relationName) {
   const message = extractSupabaseErrorMessage(error).toLowerCase();
   const relation = String(relationName || '').trim().toLowerCase();
   return (
-    error?.code === 'PGRST205'
     || error?.code === '42P01'
-    || message.includes('schema cache')
-    || (relation && message.includes(relation))
+    || (relation && message.includes(`could not find the table 'public.${relation}' in the schema cache`))
+    || (relation && message.includes(`relation "public.${relation}" does not exist`))
+    || (relation && message.includes(`relation "${relation}" does not exist`))
   );
+}
+
+function extractMissingSupabaseColumn(error, relationName) {
+  const message = extractSupabaseErrorMessage(error);
+  if (!message) {
+    return null;
+  }
+
+  const match = message.match(/Could not find the '([^']+)' column of '([^']+)' in the schema cache/i);
+  if (!match) {
+    return null;
+  }
+
+  const columnName = String(match[1] || '').trim();
+  const targetRelation = String(match[2] || '').trim().toLowerCase();
+  const relation = String(relationName || '').trim().toLowerCase();
+  if (!columnName || !relation || targetRelation !== relation) {
+    return null;
+  }
+
+  return columnName;
 }
 
 function createMissingSupabaseTableError(tableName, error) {
@@ -383,6 +426,19 @@ function createMissingSupabaseTableError(tableName, error) {
   missing.statusCode = 503;
   missing.details = {
     table: tableName,
+    supabaseMessage: extractSupabaseErrorMessage(error) || null
+  };
+  return missing;
+}
+
+function createMissingSupabaseColumnError(tableName, columnName, error) {
+  const missing = new Error(
+    `Supabase column public.${tableName}.${columnName} is missing in the connected project. Apply supabase/proof_helper.sql again so the existing table is migrated.`
+  );
+  missing.statusCode = 503;
+  missing.details = {
+    table: tableName,
+    column: columnName,
     supabaseMessage: extractSupabaseErrorMessage(error) || null
   };
   return missing;
@@ -471,23 +527,27 @@ async function inspectSupabaseSchema() {
   let ok = true;
 
   for (const tableName of REQUIRED_SUPABASE_TABLES) {
+    const requiredColumns = REQUIRED_SUPABASE_COLUMNS[tableName] || ['id'];
     const { error: tableError } = await client
       .from(tableName)
-      .select('*', { head: true, count: 'exact' })
+      .select(requiredColumns.join(','), { head: true, count: 'exact' })
       .limit(1);
 
     if (tableError) {
       ok = false;
+      const missingColumn = extractMissingSupabaseColumn(tableError, tableName);
       tables[tableName] = {
         present: false,
-        error: extractSupabaseErrorMessage(tableError) || 'Unknown schema error'
+        error: extractSupabaseErrorMessage(tableError) || 'Unknown schema error',
+        missingColumn: missingColumn || null
       };
       continue;
     }
 
     tables[tableName] = {
       present: true,
-      error: null
+      error: null,
+      missingColumn: null
     };
   }
 
@@ -1083,20 +1143,45 @@ async function saveProblemRecord(plan, result, proofState, completedFormat) {
     }
   };
 
-  const { data, error: insertError } = await client
-    .from('problems')
-    .insert(record)
-    .select('id, created_at')
-    .single();
+  return insertProblemRecordWithFallback(client, record);
+}
 
-  if (insertError) {
+async function insertProblemRecordWithFallback(client, record) {
+  const mutableRecord = { ...(record || {}) };
+  const droppedColumns = [];
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const { data, error: insertError } = await client
+      .from('problems')
+      .insert(mutableRecord)
+      .select('id, created_at')
+      .single();
+
+    if (!insertError) {
+      return {
+        ...(data || { id: null, created_at: nowIso() }),
+        droppedColumns
+      };
+    }
+
+    const missingColumn = extractMissingSupabaseColumn(insertError, 'problems');
+    if (missingColumn && Object.prototype.hasOwnProperty.call(mutableRecord, missingColumn)) {
+      delete mutableRecord[missingColumn];
+      droppedColumns.push(missingColumn);
+      continue;
+    }
+
+    if (missingColumn) {
+      throw createMissingSupabaseColumnError('problems', missingColumn, insertError);
+    }
+
     if (isMissingSupabaseRelationError(insertError, 'problems')) {
       throw createMissingSupabaseTableError('problems', insertError);
     }
     throw new Error(insertError.message || 'Failed to save problem row.');
   }
 
-  return data || { id: null, created_at: nowIso() };
+  throw new Error('Failed to save problem row after retrying without missing Supabase columns.');
 }
 
 function resolveVerificationStatus(result) {
