@@ -7,7 +7,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const MAX_CODE_BYTES = Number(process.env.HELPER_MAX_CODE_BYTES || 200000);
 const SERVICE_NAME = String(process.env.SERVICE_NAME || 'ivucx-railway-helper').trim() || 'ivucx-railway-helper';
-const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.1').trim() || '1.7.1';
+const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.2').trim() || '1.7.2';
 
 const HELPER_API_KEY = String(process.env.HELPER_API_KEY || '').trim();
 const EXECUTION_SERVER_BASE_URL = String(process.env.EXECUTION_SERVER_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -16,6 +16,7 @@ const EXECUTION_SERVER_TIMEOUT_MS = Number(process.env.EXECUTION_SERVER_TIMEOUT_
 const EXECUTION_SERVER_CONVERT_ROUTE = String(process.env.EXECUTION_SERVER_CONVERT_ROUTE || '/api/proof-convert').trim();
 const EXECUTION_SERVER_LEAN_CHECK_ROUTE = String(process.env.EXECUTION_SERVER_LEAN_CHECK_ROUTE || '/api/lean-check').trim();
 const EXECUTION_SERVER_COQ_CHECK_ROUTE = String(process.env.EXECUTION_SERVER_COQ_CHECK_ROUTE || '/api/coq-check').trim();
+const EXECUTION_BASE_URL_HEADER = 'x-ivucx-execution-base-url';
 
 const JOB_STATUS = {
   QUEUED: 'queued',
@@ -86,6 +87,8 @@ app.get('/healthz', (_req, res) => {
 app.get('/api/helper/info', (_req, res) => {
   const supabase = getSupabaseAdmin();
   const supabaseEnv = resolveSupabaseEnv();
+  const executionInfo = getExecutionInfo(_req);
+  const executionConfigured = !!executionInfo.configured;
   res.status(200).json({
     ok: true,
     service: SERVICE_NAME,
@@ -96,7 +99,7 @@ app.get('/api/helper/info', (_req, res) => {
       serviceRoleConfigured: !!supabaseEnv.serviceRoleKey,
       anonConfigured: !!supabaseEnv.anonKey
     },
-    executionConfigured: !!EXECUTION_SERVER_BASE_URL,
+    executionConfigured,
     roles: getRoleInfo(),
     capabilities: {
       proofCheck: true,
@@ -105,6 +108,7 @@ app.get('/api/helper/info', (_req, res) => {
       cicConvert: true,
       planState: true,
       schemaCheck: true,
+      executionBridge: true,
       memorySchemaFallback: ENABLE_MEMORY_SCHEMA_FALLBACK,
       asyncJobs: true
     },
@@ -125,15 +129,15 @@ app.get('/api/helper/info', (_req, res) => {
           ? (ENABLE_MEMORY_SCHEMA_FALLBACK ? 'supabase-with-memory-fallback' : 'supabase')
           : 'memory',
         planning: 'railway',
-        proofCheck: EXECUTION_SERVER_BASE_URL ? 'render' : 'unconfigured',
-        conversion: EXECUTION_SERVER_BASE_URL ? 'render' : 'unconfigured'
+        proofCheck: executionConfigured ? 'render' : 'unconfigured',
+        conversion: executionConfigured ? 'render' : 'unconfigured'
       },
       conversionRuntimes: {
-        typedLambda: buildConversionAvailability(),
-        cic: buildConversionAvailability()
+        typedLambda: buildConversionAvailability(_req),
+        cic: buildConversionAvailability(_req)
       }
     },
-    execution: getExecutionInfo()
+    execution: executionInfo
   });
 });
 
@@ -156,7 +160,7 @@ app.get('/api/helper/schema-check', async (_req, res) => {
 app.post('/api/helper/check', async (req, res) => {
   try {
     const payload = normalizeProofPayload(req.body || {});
-    const verification = await requestExecutionCheck(payload);
+    const verification = await requestExecutionCheck(payload, req);
     res.status(statusCodeForVerification(verification)).json({ ok: verification.ok, verification });
   } catch (err) {
     res.status(err && err.statusCode ? err.statusCode : 400).json({
@@ -232,27 +236,71 @@ function getRoleInfo() {
   };
 }
 
-function buildConversionAvailability() {
+function buildConversionAvailability(req) {
+  const executionBaseUrl = resolveExecutionBaseUrlFromRequest(req);
   return {
     lean: {
-      available: !!EXECUTION_SERVER_BASE_URL,
+      available: !!executionBaseUrl,
       planner: 'railway',
-      executor: EXECUTION_SERVER_BASE_URL ? 'render' : 'unconfigured',
+      executor: executionBaseUrl ? 'render' : 'unconfigured',
       stateStore: 'supabase'
     },
     coq: {
-      available: !!EXECUTION_SERVER_BASE_URL,
+      available: !!executionBaseUrl,
       planner: 'railway',
-      executor: EXECUTION_SERVER_BASE_URL ? 'render' : 'unconfigured',
+      executor: executionBaseUrl ? 'render' : 'unconfigured',
       stateStore: 'supabase'
     }
   };
 }
 
-function getExecutionInfo() {
+function firstNonEmptyHeaderValue(value) {
+  if (Array.isArray(value)) {
+    return firstNonEmptyHeaderValue(value[0]);
+  }
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.split(',')[0].trim();
+}
+
+function normalizeRemoteBaseUrl(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized) {
+    return '';
+  }
+  return normalized.replace(/\/+$/, '');
+}
+
+function resolveExecutionBaseUrlFromRequest(req) {
+  const forwarded = req && req.headers
+    ? (
+      req.headers[EXECUTION_BASE_URL_HEADER]
+      || req.headers[EXECUTION_BASE_URL_HEADER.toLowerCase()]
+    )
+    : '';
+  return normalizeRemoteBaseUrl(firstNonEmptyHeaderValue(forwarded) || EXECUTION_SERVER_BASE_URL);
+}
+
+function resolveExecutionBaseUrlFromPlan(plan) {
+  return normalizeRemoteBaseUrl(
+    plan?.executionPayload?.executionBaseUrl
+    || plan?.plan?.execution?.baseUrl
+    || plan?.requestMeta?.executionBaseUrl
+    || EXECUTION_SERVER_BASE_URL
+  );
+}
+
+function getExecutionInfo(reqOrPlan = null) {
+  const baseUrl = reqOrPlan && reqOrPlan.headers
+    ? resolveExecutionBaseUrlFromRequest(reqOrPlan)
+    : resolveExecutionBaseUrlFromPlan(reqOrPlan);
   return {
-    configured: !!EXECUTION_SERVER_BASE_URL,
-    baseUrl: EXECUTION_SERVER_BASE_URL || null,
+    configured: !!baseUrl,
+    baseUrl: baseUrl || null,
+    source: baseUrl
+      ? (normalizeRemoteBaseUrl(EXECUTION_SERVER_BASE_URL) === baseUrl ? 'helper-env' : 'request-bridge')
+      : 'unconfigured',
     convertRoute: EXECUTION_SERVER_CONVERT_ROUTE,
     leanCheckRoute: EXECUTION_SERVER_LEAN_CHECK_ROUTE,
     coqCheckRoute: EXECUTION_SERVER_COQ_CHECK_ROUTE,
@@ -495,13 +543,13 @@ async function handlePlannedRequest(req, res, operation) {
     const wantsAsync = req.body && req.body.async !== false;
 
     if (!wantsAsync) {
-      const plan = await createConversionPlan(payload, operation, null);
+      const plan = await createConversionPlan(payload, operation, null, req);
       const result = await executePlannedOperation(plan, null);
       res.status(statusCodeForResult(result)).json({ ok: Boolean(result.ok), result });
       return;
     }
 
-    const job = await createPlannedJob(payload, operation);
+    const job = await createPlannedJob(payload, operation, req);
     res.status(202).json({ ok: true, job: publicJob(job) });
 
     queueMicrotask(() => {
@@ -517,7 +565,7 @@ async function handlePlannedRequest(req, res, operation) {
   }
 }
 
-async function createPlannedJob(payload, operation) {
+async function createPlannedJob(payload, operation, req) {
   const job = {
     id: randomUUID(),
     status: JOB_STATUS.QUEUED,
@@ -536,14 +584,14 @@ async function createPlannedJob(payload, operation) {
     problemId: null,
     planId: null
   };
-  const plan = await createConversionPlan(payload, operation, job.id);
+  const plan = await createConversionPlan(payload, operation, job.id, req);
   job.planId = plan.id;
   await persistJob(job);
   jobs.set(job.id, job);
   return job;
 }
 
-async function createConversionPlan(payload, operation, helperJobId) {
+async function createConversionPlan(payload, operation, helperJobId, req) {
   const { client, error } = getSupabaseAdmin();
   if (!client) {
     throw new Error(error || 'Supabase is not configured on the helper server.');
@@ -553,6 +601,7 @@ async function createConversionPlan(payload, operation, helperJobId) {
   const sourceSha256 = sha256(payload.code);
   const closure = analyzeProofState(payload.language, payload.code);
   const createdAt = nowIso();
+  const executionInfo = getExecutionInfo(req);
 
   const plan = {
     id: randomUUID(),
@@ -585,6 +634,10 @@ async function createConversionPlan(payload, operation, helperJobId) {
         convert: EXECUTION_SERVER_CONVERT_ROUTE,
         leanCheck: EXECUTION_SERVER_LEAN_CHECK_ROUTE,
         coqCheck: EXECUTION_SERVER_COQ_CHECK_ROUTE
+      },
+      execution: {
+        baseUrl: executionInfo.baseUrl,
+        source: executionInfo.source
       }
     },
     progress: createProgress(12, 'planning', 'Planning'),
@@ -593,6 +646,7 @@ async function createConversionPlan(payload, operation, helperJobId) {
       fileName: payload.fileName,
       format: payload.format || 'typed-lambda-v1',
       verify: payload.verify !== false,
+      executionBaseUrl: executionInfo.baseUrl,
       sourceSha256,
       sourceBytes
     },
@@ -601,6 +655,8 @@ async function createConversionPlan(payload, operation, helperJobId) {
     requestMeta: {
       sourceBytes,
       createdBy: 'railway-helper',
+      executionBaseUrl: executionInfo.baseUrl,
+      executionSource: executionInfo.source,
       helperJobId: helperJobId || null
     },
     createdAt,
@@ -743,8 +799,11 @@ async function executePlannedOperation(plan, job) {
 }
 
 async function executeRemoteConversion(plan, format) {
-  if (!EXECUTION_SERVER_BASE_URL) {
-    const error = new Error('EXECUTION_SERVER_BASE_URL is not configured on the helper server.');
+  const executionInfo = getExecutionInfo(plan);
+  if (!executionInfo.configured || !executionInfo.baseUrl) {
+    const error = new Error(
+      'No execution server base URL is available on the helper server. Set EXECUTION_SERVER_BASE_URL or call through the Render app proxy.'
+    );
     error.statusCode = 503;
     throw error;
   }
@@ -757,7 +816,7 @@ async function executeRemoteConversion(plan, format) {
     verify: plan.verify
   };
 
-  const upstream = await sendExecutionRequest(EXECUTION_SERVER_CONVERT_ROUTE, executionPayload);
+  const upstream = await sendExecutionRequest(EXECUTION_SERVER_CONVERT_ROUTE, executionPayload, executionInfo.baseUrl);
   const payload = upstream.payload && typeof upstream.payload === 'object' ? upstream.payload : null;
 
   if (payload && payload.result && typeof payload.result === 'object') {
@@ -818,17 +877,20 @@ function shouldRetryWithTypedLambda(requestedFormat, message) {
   );
 }
 
-async function requestExecutionCheck(payload) {
+async function requestExecutionCheck(payload, req) {
   const route = payload.language === 'Coq' ? EXECUTION_SERVER_COQ_CHECK_ROUTE : EXECUTION_SERVER_LEAN_CHECK_ROUTE;
-  if (!EXECUTION_SERVER_BASE_URL) {
-    const error = new Error('EXECUTION_SERVER_BASE_URL is not configured on the helper server.');
+  const executionInfo = getExecutionInfo(req);
+  if (!executionInfo.configured || !executionInfo.baseUrl) {
+    const error = new Error(
+      'No execution server base URL is available on the helper server. Set EXECUTION_SERVER_BASE_URL or call through the Render app proxy.'
+    );
     error.statusCode = 503;
     throw error;
   }
   const upstream = await sendExecutionRequest(route, {
     code: payload.code,
     fileName: payload.fileName
-  });
+  }, executionInfo.baseUrl);
   const body = upstream.payload && typeof upstream.payload === 'object' ? upstream.payload : {};
   return {
     ok: Boolean(body.ok),
@@ -856,7 +918,7 @@ function statusCodeForVerification(verification) {
   return verification.upstreamStatus >= 400 ? verification.upstreamStatus : 422;
 }
 
-async function sendExecutionRequest(targetPath, body) {
+async function sendExecutionRequest(targetPath, body, executionBaseUrl = EXECUTION_SERVER_BASE_URL) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), EXECUTION_SERVER_TIMEOUT_MS);
   const headers = {
@@ -868,7 +930,7 @@ async function sendExecutionRequest(targetPath, body) {
   }
 
   try {
-    const response = await fetch(EXECUTION_SERVER_BASE_URL + targetPath, {
+    const response = await fetch(String(executionBaseUrl || '').replace(/\/+$/, '') + targetPath, {
       method: 'POST',
       headers,
       body: JSON.stringify(body || {}),
