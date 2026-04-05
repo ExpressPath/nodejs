@@ -7,7 +7,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const MAX_CODE_BYTES = Number(process.env.HELPER_MAX_CODE_BYTES || 200000);
 const SERVICE_NAME = String(process.env.SERVICE_NAME || 'ivucx-railway-helper').trim() || 'ivucx-railway-helper';
-const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.2').trim() || '1.7.2';
+const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.3').trim() || '1.7.3';
 
 const HELPER_API_KEY = String(process.env.HELPER_API_KEY || '').trim();
 const EXECUTION_SERVER_BASE_URL = String(process.env.EXECUTION_SERVER_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -812,8 +812,13 @@ async function executeRemoteConversion(plan, format) {
 
   const executionPayload = {
     planId: plan.id,
+    title: plan.title || '',
+    language: plan.language,
+    fileName: plan.fileName,
+    code: plan.sourceCode,
     format,
-    verify: plan.verify
+    verify: plan.verify,
+    sourceSha256: plan.sourceSha256 || null
   };
 
   const upstream = await sendExecutionRequest(EXECUTION_SERVER_CONVERT_ROUTE, executionPayload, executionInfo.baseUrl);

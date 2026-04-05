@@ -1,6 +1,6 @@
 ﻿{
     "name":  "ivucx-railway-helper",
-    "version":  "1.7.2",
+    "version":  "1.7.3",
     "private":  true,
     "type":  "module",
     "main":  "app.js",
@@ -16,5 +16,6 @@
                     "node":  "\u003e=20.0.0"
                 }
 }
+
 
 
