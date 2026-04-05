@@ -7,7 +7,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const MAX_CODE_BYTES = Number(process.env.HELPER_MAX_CODE_BYTES || 200000);
 const SERVICE_NAME = String(process.env.SERVICE_NAME || 'ivucx-railway-helper').trim() || 'ivucx-railway-helper';
-const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.5').trim() || '1.7.5';
+const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.6').trim() || '1.7.6';
 
 const HELPER_API_KEY = String(process.env.HELPER_API_KEY || '').trim();
 const EXECUTION_SERVER_BASE_URL = String(process.env.EXECUTION_SERVER_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -17,6 +17,13 @@ const EXECUTION_SERVER_CONVERT_ROUTE = String(process.env.EXECUTION_SERVER_CONVE
 const EXECUTION_SERVER_LEAN_CHECK_ROUTE = String(process.env.EXECUTION_SERVER_LEAN_CHECK_ROUTE || '/api/lean-check').trim();
 const EXECUTION_SERVER_COQ_CHECK_ROUTE = String(process.env.EXECUTION_SERVER_COQ_CHECK_ROUTE || '/api/coq-check').trim();
 const EXECUTION_BASE_URL_HEADER = 'x-ivucx-execution-base-url';
+const HELPER_ALLOWED_ORIGINS = String(
+  process.env.HELPER_ALLOWED_ORIGINS
+  || 'https://provf.onrender.com,http://localhost:3000,http://127.0.0.1:3000'
+)
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
 
 const JOB_STATUS = {
   QUEUED: 'queued',
@@ -51,6 +58,26 @@ let supabaseClient = null;
 app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
+app.use((req, res, next) => {
+  const origin = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
+  const allowAll = HELPER_ALLOWED_ORIGINS.includes('*');
+  const allowOrigin = allowAll || (origin && HELPER_ALLOWED_ORIGINS.includes(origin));
+
+  if (allowOrigin) {
+    res.setHeader('Access-Control-Allow-Origin', allowAll ? '*' : origin);
+    res.setHeader('Vary', 'Origin');
+  }
+
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Ivucx-Execution-Base-Url');
+
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
+
+  next();
+});
 
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
