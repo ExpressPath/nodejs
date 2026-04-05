@@ -1,18 +1,19 @@
 ﻿{
-  "name": "ivucx-railway-helper",
-  "version": "1.7.0",
-  "private": true,
-  "type": "module",
-  "main": "app.js",
-  "description": "Railway planner/orchestrator for Supabase-backed proof conversion jobs.",
-  "scripts": {
-    "start": "node app.js"
-  },
-  "dependencies": {
-    "@supabase/supabase-js": "^2.50.2",
-    "express": "^4.19.2"
-  },
-  "engines": {
-    "node": ">=20.0.0"
-  }
+    "name":  "ivucx-railway-helper",
+    "version":  "1.7.1",
+    "private":  true,
+    "type":  "module",
+    "main":  "app.js",
+    "description":  "Railway planner/orchestrator for Supabase-backed proof conversion jobs.",
+    "scripts":  {
+                    "start":  "node app.js"
+                },
+    "dependencies":  {
+                         "@supabase/supabase-js":  "^2.50.2",
+                         "express":  "^4.19.2"
+                     },
+    "engines":  {
+                    "node":  "\u003e=20.0.0"
+                }
 }
+

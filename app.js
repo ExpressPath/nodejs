@@ -1,4 +1,4 @@
-﻿import express from 'express';
+import express from 'express';
 import { createHash, randomUUID, timingSafeEqual } from 'crypto';
 import { createClient } from '@supabase/supabase-js';
 
@@ -7,7 +7,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const MAX_CODE_BYTES = Number(process.env.HELPER_MAX_CODE_BYTES || 200000);
 const SERVICE_NAME = String(process.env.SERVICE_NAME || 'ivucx-railway-helper').trim() || 'ivucx-railway-helper';
-const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.0').trim() || '1.7.0';
+const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.1').trim() || '1.7.1';
 
 const HELPER_API_KEY = String(process.env.HELPER_API_KEY || '').trim();
 const EXECUTION_SERVER_BASE_URL = String(process.env.EXECUTION_SERVER_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -32,6 +32,12 @@ const PLAN_STATUS = {
   SUCCEEDED: 'succeeded',
   FAILED: 'failed'
 };
+
+const REQUIRED_SUPABASE_TABLES = Object.freeze([
+  'helper_jobs',
+  'helper_conversion_plans',
+  'problems'
+]);
 
 const jobs = new Map();
 let supabaseClient = null;
@@ -93,10 +99,12 @@ app.get('/api/helper/info', (_req, res) => {
       submit: true,
       cicConvert: true,
       planState: true,
+      schemaCheck: true,
       asyncJobs: true
     },
     routes: [
       'GET /api/helper/info',
+      'GET /api/helper/schema-check',
       'POST /api/helper/check',
       'POST /api/helper/submit',
       'POST /api/helper/convert',
@@ -119,6 +127,22 @@ app.get('/api/helper/info', (_req, res) => {
     },
     execution: getExecutionInfo()
   });
+});
+
+app.get('/api/helper/schema-check', async (_req, res) => {
+  try {
+    const schema = await inspectSupabaseSchema();
+    res.status(schema.ok ? 200 : 503).json({
+      ok: schema.ok,
+      schema
+    });
+  } catch (err) {
+    res.status(err && err.statusCode ? err.statusCode : 500).json({
+      ok: false,
+      error: err && err.message ? err.message : String(err),
+      details: err && err.details ? err.details : null
+    });
+  }
 });
 
 app.post('/api/helper/check', async (req, res) => {
@@ -228,6 +252,36 @@ function getExecutionInfo() {
   };
 }
 
+function extractSupabaseErrorMessage(error) {
+  if (!error || typeof error !== 'object') {
+    return '';
+  }
+  return String(error.message || error.details || error.hint || '').trim();
+}
+
+function isMissingSupabaseRelationError(error, relationName) {
+  const message = extractSupabaseErrorMessage(error).toLowerCase();
+  const relation = String(relationName || '').trim().toLowerCase();
+  return (
+    error?.code === 'PGRST205'
+    || error?.code === '42P01'
+    || message.includes('schema cache')
+    || (relation && message.includes(relation))
+  );
+}
+
+function createMissingSupabaseTableError(tableName, error) {
+  const missing = new Error(
+    `Supabase table public.${tableName} is missing in the connected project. Apply supabase/proof_helper.sql to the same project referenced by NEXT_PUBLIC_SUPABASE_URL.`
+  );
+  missing.statusCode = 503;
+  missing.details = {
+    table: tableName,
+    supabaseMessage: extractSupabaseErrorMessage(error) || null
+  };
+  return missing;
+}
+
 function firstNonEmpty(values) {
   for (const value of values) {
     const normalized = typeof value === 'string' ? value.trim() : '';
@@ -290,6 +344,48 @@ function getSupabaseAdmin() {
     });
   }
   return { client: supabaseClient, error: null };
+}
+
+async function inspectSupabaseSchema() {
+  const { client, error } = getSupabaseAdmin();
+  if (!client) {
+    return {
+      ok: false,
+      configured: false,
+      error: error || 'Supabase is not configured.',
+      tables: {}
+    };
+  }
+
+  const tables = {};
+  let ok = true;
+
+  for (const tableName of REQUIRED_SUPABASE_TABLES) {
+    const { error: tableError } = await client
+      .from(tableName)
+      .select('*', { head: true, count: 'exact' })
+      .limit(1);
+
+    if (tableError) {
+      ok = false;
+      tables[tableName] = {
+        present: false,
+        error: extractSupabaseErrorMessage(tableError) || 'Unknown schema error'
+      };
+      continue;
+    }
+
+    tables[tableName] = {
+      present: true,
+      error: null
+    };
+  }
+
+  return {
+    ok,
+    configured: true,
+    tables
+  };
 }
 
 function nowIso() {
@@ -999,6 +1095,9 @@ async function listJobs() {
     .select('*')
     .order('created_at', { ascending: false })
     .limit(100);
+  if (error && isMissingSupabaseRelationError(error, 'helper_jobs')) {
+    throw createMissingSupabaseTableError('helper_jobs', error);
+  }
   if (error) {
     return Array.from(jobs.values()).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
   }
@@ -1013,6 +1112,9 @@ async function loadPersistedJob(id) {
     .select('*')
     .eq('id', id)
     .maybeSingle();
+  if (error && isMissingSupabaseRelationError(error, 'helper_jobs')) {
+    throw createMissingSupabaseTableError('helper_jobs', error);
+  }
   if (error || !data) return null;
   const job = hydrateJobRow(data);
   jobs.set(job.id, job);
@@ -1064,6 +1166,9 @@ async function persistJob(job) {
     completed_at: job.completedAt
   });
   if (error) {
+    if (isMissingSupabaseRelationError(error, 'helper_jobs')) {
+      throw createMissingSupabaseTableError('helper_jobs', error);
+    }
     const writeError = new Error(`Failed to persist helper_jobs row: ${error.message || 'unknown Supabase error'}`);
     writeError.statusCode = 502;
     throw writeError;
@@ -1083,6 +1188,9 @@ async function loadPersistedPlan(id) {
     .select('*')
     .eq('id', id)
     .maybeSingle();
+  if (error && isMissingSupabaseRelationError(error, 'helper_conversion_plans')) {
+    throw createMissingSupabaseTableError('helper_conversion_plans', error);
+  }
   if (error || !data) return null;
   return hydratePlanRow(data);
 }
@@ -1146,6 +1254,9 @@ async function persistPlan(plan) {
     completed_at: plan.completedAt
   });
   if (error) {
+    if (isMissingSupabaseRelationError(error, 'helper_conversion_plans')) {
+      throw createMissingSupabaseTableError('helper_conversion_plans', error);
+    }
     const writeError = new Error(
       `Failed to persist helper_conversion_plans row: ${error.message || 'unknown Supabase error'}`
     );
@@ -1289,7 +1400,7 @@ async function recoverStaleJobs() {
   const now = nowIso();
   const restartMessage = { message: 'Helper server restarted before the job finished.' };
   try {
-    await client
+    const jobsRecovery = await client
       .from('helper_jobs')
       .update({
         status: JOB_STATUS.FAILED,
@@ -1299,8 +1410,11 @@ async function recoverStaleJobs() {
         completed_at: now
       })
       .in('status', [JOB_STATUS.QUEUED, JOB_STATUS.RUNNING]);
+    if (jobsRecovery.error && isMissingSupabaseRelationError(jobsRecovery.error, 'helper_jobs')) {
+      throw createMissingSupabaseTableError('helper_jobs', jobsRecovery.error);
+    }
 
-    await client
+    const plansRecovery = await client
       .from('helper_conversion_plans')
       .update({
         status: PLAN_STATUS.FAILED,
@@ -1310,6 +1424,9 @@ async function recoverStaleJobs() {
         completed_at: now
       })
       .in('status', [PLAN_STATUS.QUEUED, PLAN_STATUS.PLANNING, PLAN_STATUS.READY, PLAN_STATUS.RUNNING]);
+    if (plansRecovery.error && isMissingSupabaseRelationError(plansRecovery.error, 'helper_conversion_plans')) {
+      throw createMissingSupabaseTableError('helper_conversion_plans', plansRecovery.error);
+    }
   } catch (err) {
     console.warn('Failed to recover stale helper jobs', err);
   }
@@ -1317,8 +1434,11 @@ async function recoverStaleJobs() {
 
 async function startServer() {
   await recoverStaleJobs();
+  const schema = await inspectSupabaseSchema();
+  if (!schema.ok) {
+    console.warn('Supabase helper schema is incomplete', schema);
+  }
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`${SERVICE_NAME} ${SERVICE_VERSION} listening on ${PORT}`);
   });
 }
-
