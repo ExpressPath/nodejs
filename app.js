@@ -1,13 +1,19 @@
 import express from 'express';
 import { createHash, randomUUID, timingSafeEqual } from 'crypto';
+import { readFile } from 'fs/promises';
+import { dirname, isAbsolute, resolve as resolvePath } from 'path';
 import { createClient } from '@supabase/supabase-js';
+import pg from 'pg';
+import { fileURLToPath } from 'url';
 
 const app = express();
+const { Client: PgClient } = pg;
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_CODE_BYTES = Number(process.env.HELPER_MAX_CODE_BYTES || 200000);
 const SERVICE_NAME = String(process.env.SERVICE_NAME || 'ivucx-railway-helper').trim() || 'ivucx-railway-helper';
-const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.8.0').trim() || '1.8.0';
+const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.8.1').trim() || '1.8.1';
 
 const HELPER_API_KEY = String(process.env.HELPER_API_KEY || '').trim();
 const EXECUTION_SERVER_BASE_URL = String(process.env.EXECUTION_SERVER_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -24,6 +30,15 @@ const HELPER_ALLOWED_ORIGINS = String(
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
+const HELPER_AUTO_SCHEMA_BOOTSTRAP = !['0', 'false', 'no', 'off'].includes(
+  String(process.env.HELPER_AUTO_SCHEMA_BOOTSTRAP || 'true').trim().toLowerCase()
+);
+const HELPER_SCHEMA_SQL_PATH = String(process.env.HELPER_SCHEMA_SQL_PATH || '').trim();
+const HELPER_SCHEMA_SQL_CANDIDATES = Object.freeze([
+  './supabase/proof_helper.sql',
+  '../supabase/proof_helper.sql',
+  '../../supabase/proof_helper.sql'
+]);
 
 const JOB_STATUS = {
   QUEUED: 'queued',
@@ -76,6 +91,15 @@ const ENABLE_MEMORY_SCHEMA_FALLBACK = !['0', 'false', 'no', 'off'].includes(
 const jobs = new Map();
 const plans = new Map();
 let supabaseClient = null;
+let supabaseSchemaBootstrapPromise = null;
+let supabaseSchemaSqlCache = null;
+let supabaseSchemaBootstrapState = {
+  attempted: false,
+  ok: false,
+  lastReason: '',
+  lastAppliedAt: '',
+  lastError: ''
+};
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
@@ -421,8 +445,11 @@ function extractMissingSupabaseColumn(error, relationName) {
 }
 
 function createMissingSupabaseTableError(tableName, error) {
+  const bootstrapHint = HELPER_AUTO_SCHEMA_BOOTSTRAP && !resolveSupabaseDbUrl()
+    ? ' Set SUPABASE_DB_URL (or DATABASE_URL / POSTGRES_URL) to let the helper create it automatically.'
+    : '';
   const missing = new Error(
-    `Supabase table public.${tableName} is missing in the connected project. Apply supabase/proof_helper.sql to the same project referenced by NEXT_PUBLIC_SUPABASE_URL.`
+    `Supabase table public.${tableName} is missing in the connected project. Apply supabase/proof_helper.sql to the same project referenced by NEXT_PUBLIC_SUPABASE_URL.${bootstrapHint}`
   );
   missing.statusCode = 503;
   missing.details = {
@@ -433,8 +460,11 @@ function createMissingSupabaseTableError(tableName, error) {
 }
 
 function createMissingSupabaseColumnError(tableName, columnName, error) {
+  const bootstrapHint = HELPER_AUTO_SCHEMA_BOOTSTRAP && !resolveSupabaseDbUrl()
+    ? ' Set SUPABASE_DB_URL (or DATABASE_URL / POSTGRES_URL) to let the helper migrate it automatically.'
+    : '';
   const missing = new Error(
-    `Supabase column public.${tableName}.${columnName} is missing in the connected project. Apply supabase/proof_helper.sql again so the existing table is migrated.`
+    `Supabase column public.${tableName}.${columnName} is missing in the connected project. Apply supabase/proof_helper.sql again so the existing table is migrated.${bootstrapHint}`
   );
   missing.statusCode = 503;
   missing.details = {
@@ -485,6 +515,149 @@ function resolveSupabaseEnv() {
   };
 }
 
+function resolveSupabaseDbUrl() {
+  return firstNonEmpty([
+    process.env.SUPABASE_DB_URL,
+    process.env.SUPABASE_DATABASE_URL,
+    process.env.SUPABASE_DB_DIRECT_URL,
+    process.env.DATABASE_URL,
+    process.env.POSTGRES_URL,
+    process.env.POSTGRES_URL_NON_POOLING,
+    process.env.POSTGRES_PRISMA_URL
+  ]);
+}
+
+function resolveSchemaSqlCandidatePath(candidatePath) {
+  if (!candidatePath) {
+    return '';
+  }
+  return isAbsolute(candidatePath)
+    ? candidatePath
+    : resolvePath(MODULE_DIR, candidatePath);
+}
+
+async function loadHelperSchemaSql() {
+  if (supabaseSchemaSqlCache) {
+    return supabaseSchemaSqlCache;
+  }
+
+  const candidates = [
+    HELPER_SCHEMA_SQL_PATH,
+    ...HELPER_SCHEMA_SQL_CANDIDATES
+  ]
+    .map((candidate) => resolveSchemaSqlCandidatePath(candidate))
+    .filter(Boolean);
+
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      const sql = await readFile(candidate, 'utf8');
+      const normalized = String(sql || '').trim();
+      if (normalized) {
+        supabaseSchemaSqlCache = normalized;
+        return normalized;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw new Error(
+    lastError && lastError.message
+      ? `Unable to load proof helper schema SQL. ${lastError.message}`
+      : 'Unable to load proof helper schema SQL.'
+  );
+}
+
+async function ensureSupabaseSchema(reason = 'runtime') {
+  if (!HELPER_AUTO_SCHEMA_BOOTSTRAP) {
+    return {
+      ok: false,
+      attempted: false,
+      skipped: 'disabled',
+      reason
+    };
+  }
+
+  if (supabaseSchemaBootstrapPromise) {
+    return supabaseSchemaBootstrapPromise;
+  }
+
+  supabaseSchemaBootstrapPromise = (async () => {
+    const connectionString = resolveSupabaseDbUrl();
+    if (!connectionString) {
+      const result = {
+        ok: false,
+        attempted: false,
+        skipped: 'missing-db-url',
+        reason,
+        error: 'No Supabase Postgres connection string is configured for automatic schema bootstrap.'
+      };
+      supabaseSchemaBootstrapState = {
+        attempted: true,
+        ok: false,
+        lastReason: reason,
+        lastAppliedAt: supabaseSchemaBootstrapState.lastAppliedAt,
+        lastError: result.error
+      };
+      return result;
+    }
+
+    const sql = await loadHelperSchemaSql();
+    const client = new PgClient({
+      connectionString,
+      ssl: /\bsslmode=disable\b/i.test(connectionString)
+        ? undefined
+        : { rejectUnauthorized: false }
+    });
+
+    try {
+      await client.connect();
+      await client.query(sql);
+      const appliedAt = nowIso();
+      const result = {
+        ok: true,
+        attempted: true,
+        reason,
+        appliedAt
+      };
+      supabaseSchemaBootstrapState = {
+        attempted: true,
+        ok: true,
+        lastReason: reason,
+        lastAppliedAt: appliedAt,
+        lastError: ''
+      };
+      return result;
+    } catch (error) {
+      const result = {
+        ok: false,
+        attempted: true,
+        reason,
+        error: error && error.message ? error.message : String(error)
+      };
+      supabaseSchemaBootstrapState = {
+        attempted: true,
+        ok: false,
+        lastReason: reason,
+        lastAppliedAt: supabaseSchemaBootstrapState.lastAppliedAt,
+        lastError: result.error
+      };
+      return result;
+    } finally {
+      try {
+        await client.end();
+      } catch (error) {
+        // ignore connection shutdown noise
+      }
+    }
+  })().finally(() => {
+    supabaseSchemaBootstrapPromise = null;
+  });
+
+  return supabaseSchemaBootstrapPromise;
+}
+
 function getSupabaseAdmin() {
   const { url, serviceRoleKey, anonKey } = resolveSupabaseEnv();
   if (!url || !serviceRoleKey) {
@@ -520,7 +693,8 @@ async function inspectSupabaseSchema() {
       ok: false,
       configured: false,
       error: error || 'Supabase is not configured.',
-      tables: {}
+      tables: {},
+      bootstrap: { ...supabaseSchemaBootstrapState }
     };
   }
 
@@ -555,7 +729,8 @@ async function inspectSupabaseSchema() {
   return {
     ok,
     configured: true,
-    tables
+    tables,
+    bootstrap: { ...supabaseSchemaBootstrapState }
   };
 }
 
@@ -1206,6 +1381,7 @@ async function saveProblemRecord(plan, result, proofState, completedFormat) {
 async function insertProblemRecordWithFallback(client, record) {
   const mutableRecord = { ...(record || {}) };
   const droppedColumns = [];
+  let bootstrapRetried = false;
 
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const { data, error: insertError } = await client
@@ -1223,16 +1399,37 @@ async function insertProblemRecordWithFallback(client, record) {
 
     const missingColumn = extractMissingSupabaseColumn(insertError, 'problems');
     if (missingColumn && Object.prototype.hasOwnProperty.call(mutableRecord, missingColumn)) {
+      if (!bootstrapRetried) {
+        bootstrapRetried = true;
+        const bootstrap = await ensureSupabaseSchema(`problems-column:${missingColumn}`);
+        if (bootstrap.ok) {
+          continue;
+        }
+      }
       delete mutableRecord[missingColumn];
       droppedColumns.push(missingColumn);
       continue;
     }
 
     if (missingColumn) {
+      if (!bootstrapRetried) {
+        bootstrapRetried = true;
+        const bootstrap = await ensureSupabaseSchema(`problems-column:${missingColumn}`);
+        if (bootstrap.ok) {
+          continue;
+        }
+      }
       throw createMissingSupabaseColumnError('problems', missingColumn, insertError);
     }
 
     if (isMissingSupabaseRelationError(insertError, 'problems')) {
+      if (!bootstrapRetried) {
+        bootstrapRetried = true;
+        const bootstrap = await ensureSupabaseSchema('problems-table');
+        if (bootstrap.ok) {
+          continue;
+        }
+      }
       throw createMissingSupabaseTableError('problems', insertError);
     }
     throw new Error(insertError.message || 'Failed to save problem row.');
@@ -1856,6 +2053,10 @@ async function recoverStaleJobs() {
 }
 
 async function startServer() {
+  const bootstrap = await ensureSupabaseSchema('startup');
+  if (bootstrap.attempted && !bootstrap.ok && !bootstrap.skipped) {
+    console.warn('Supabase helper schema bootstrap failed', bootstrap);
+  }
   await recoverStaleJobs();
   const schema = await inspectSupabaseSchema();
   if (!schema.ok) {
