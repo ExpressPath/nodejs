@@ -7,7 +7,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const MAX_CODE_BYTES = Number(process.env.HELPER_MAX_CODE_BYTES || 200000);
 const SERVICE_NAME = String(process.env.SERVICE_NAME || 'ivucx-railway-helper').trim() || 'ivucx-railway-helper';
-const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.9').trim() || '1.7.9';
+const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.8.0').trim() || '1.8.0';
 
 const HELPER_API_KEY = String(process.env.HELPER_API_KEY || '').trim();
 const EXECUTION_SERVER_BASE_URL = String(process.env.EXECUTION_SERVER_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -1034,9 +1034,39 @@ function statusCodeForVerification(verification) {
   return verification.upstreamStatus >= 400 ? verification.upstreamStatus : 422;
 }
 
+const EXECUTION_REQUEST_RETRY_DELAYS_MS = Object.freeze([0, 1800, 4200, 7000]);
+
+function shouldRetryExecutionStatus(status) {
+  return [502, 503, 504].includes(Number(status || 0));
+}
+
+function shouldRetryExecutionError(error) {
+  if (!error) return false;
+  const statusCode = Number(error.statusCode || 0);
+  if (shouldRetryExecutionStatus(statusCode)) {
+    return true;
+  }
+  const message = String(error.message || error).trim().toLowerCase();
+  return (
+    message.includes('bad gateway')
+    || message.includes('service unavailable')
+    || message.includes('gateway timeout')
+    || message.includes('fetch failed')
+    || message.includes('econnreset')
+    || message.includes('socket hang up')
+    || message.includes('timed out')
+    || message.includes('timeout')
+  );
+}
+
+async function waitExecutionRetry(delayMs) {
+  if (!(delayMs > 0)) {
+    return;
+  }
+  await new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
 async function sendExecutionRequest(targetPath, body, executionBaseUrl = EXECUTION_SERVER_BASE_URL) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), EXECUTION_SERVER_TIMEOUT_MS);
   const headers = {
     Accept: 'application/json',
     'Content-Type': 'application/json'
@@ -1045,32 +1075,58 @@ async function sendExecutionRequest(targetPath, body, executionBaseUrl = EXECUTI
     headers.Authorization = `Bearer ${EXECUTION_SERVER_API_KEY}`;
   }
 
-  try {
-    const response = await fetch(String(executionBaseUrl || '').replace(/\/+$/, '') + targetPath, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body || {}),
-      signal: controller.signal
-    });
-    const text = await response.text();
-    clearTimeout(timer);
-    return {
-      ok: response.ok,
-      status: response.status,
-      text,
-      payload: tryParseJson(text)
-    };
-  } catch (err) {
-    clearTimeout(timer);
-    const timedOut = err && (err.name === 'AbortError' || err.code === 'ABORT_ERR');
-    const error = new Error(
-      timedOut
-        ? 'Execution server timed out while running the requested proof task.'
-        : (err && err.message ? err.message : String(err))
-    );
-    error.statusCode = timedOut ? 504 : 502;
-    throw error;
+  const normalizedBaseUrl = String(executionBaseUrl || '').replace(/\/+$/, '');
+  let lastError = null;
+
+  for (let attemptIndex = 0; attemptIndex < EXECUTION_REQUEST_RETRY_DELAYS_MS.length; attemptIndex += 1) {
+    const retryDelayMs = EXECUTION_REQUEST_RETRY_DELAYS_MS[attemptIndex];
+    if (retryDelayMs > 0) {
+      await waitExecutionRetry(retryDelayMs);
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), EXECUTION_SERVER_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(normalizedBaseUrl + targetPath, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body || {}),
+        signal: controller.signal
+      });
+      const text = await response.text();
+      clearTimeout(timer);
+      const result = {
+        ok: response.ok,
+        status: response.status,
+        text,
+        payload: tryParseJson(text)
+      };
+      if (shouldRetryExecutionStatus(response.status) && attemptIndex < EXECUTION_REQUEST_RETRY_DELAYS_MS.length - 1) {
+        const transientError = new Error(`Execution server returned ${response.status}.`);
+        transientError.statusCode = response.status;
+        lastError = transientError;
+        continue;
+      }
+      return result;
+    } catch (err) {
+      clearTimeout(timer);
+      const timedOut = err && (err.name === 'AbortError' || err.code === 'ABORT_ERR');
+      const error = new Error(
+        timedOut
+          ? 'Execution server timed out while running the requested proof task.'
+          : (err && err.message ? err.message : String(err))
+      );
+      error.statusCode = timedOut ? 504 : 502;
+      if (attemptIndex < EXECUTION_REQUEST_RETRY_DELAYS_MS.length - 1 && shouldRetryExecutionError(error)) {
+        lastError = error;
+        continue;
+      }
+      throw error;
+    }
   }
+
+  throw lastError || new Error('Execution server request failed.');
 }
 
 function extractExecutionError(payload, rawText, status) {
