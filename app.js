@@ -7,7 +7,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const MAX_CODE_BYTES = Number(process.env.HELPER_MAX_CODE_BYTES || 200000);
 const SERVICE_NAME = String(process.env.SERVICE_NAME || 'ivucx-railway-helper').trim() || 'ivucx-railway-helper';
-const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.8').trim() || '1.7.8';
+const SERVICE_VERSION = String(process.env.SERVICE_VERSION || '1.7.9').trim() || '1.7.9';
 
 const HELPER_API_KEY = String(process.env.HELPER_API_KEY || '').trim();
 const EXECUTION_SERVER_BASE_URL = String(process.env.EXECUTION_SERVER_BASE_URL || '').trim().replace(/\/+$/, '');
@@ -391,6 +391,7 @@ function isMissingSupabaseRelationError(error, relationName) {
   const message = extractSupabaseErrorMessage(error).toLowerCase();
   const relation = String(relationName || '').trim().toLowerCase();
   return (
+    error?.code === 'PGRST205'
     || error?.code === '42P01'
     || (relation && message.includes(`could not find the table 'public.${relation}' in the schema cache`))
     || (relation && message.includes(`relation "public.${relation}" does not exist`))
