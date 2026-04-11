@@ -5,6 +5,7 @@ import { dirname, isAbsolute, resolve as resolvePath } from 'path';
 import { createClient } from '@supabase/supabase-js';
 import pg from 'pg';
 import { fileURLToPath } from 'url';
+import { attachExecutionRequestAuthHeaders, isLikelyOracleControlPlaneUrl } from './lib/execution-auth.js';
 
 const app = express();
 const { Client: PgClient } = pg;
@@ -400,7 +401,10 @@ function getExecutionInfo(reqOrPlan = null) {
     convertRoute: EXECUTION_SERVER_CONVERT_ROUTE,
     leanCheckRoute: EXECUTION_SERVER_LEAN_CHECK_ROUTE,
     coqCheckRoute: EXECUTION_SERVER_COQ_CHECK_ROUTE,
-    timeoutMs: EXECUTION_SERVER_TIMEOUT_MS
+    timeoutMs: EXECUTION_SERVER_TIMEOUT_MS,
+    warning: isLikelyOracleControlPlaneUrl(baseUrl)
+      ? 'Configured execution URL looks like the Oracle Cloud control-plane endpoint, not the Oracle-server app URL.'
+      : null
   };
 }
 
@@ -1242,7 +1246,7 @@ async function waitExecutionRetry(delayMs) {
 }
 
 async function sendExecutionRequest(targetPath, body, executionBaseUrl = EXECUTION_SERVER_BASE_URL) {
-  const headers = {
+  let headers = {
     Accept: 'application/json',
     'Content-Type': 'application/json'
   };
@@ -1251,6 +1255,21 @@ async function sendExecutionRequest(targetPath, body, executionBaseUrl = EXECUTI
   }
 
   const normalizedBaseUrl = String(executionBaseUrl || '').replace(/\/+$/, '');
+  if (isLikelyOracleControlPlaneUrl(normalizedBaseUrl)) {
+    const error = new Error(
+      `Execution server base URL looks like the Oracle Cloud control-plane endpoint (${normalizedBaseUrl}). Set EXECUTION_SERVER_BASE_URL to the public URL of the Oracle-server app.`
+    );
+    error.statusCode = 503;
+    throw error;
+  }
+
+  const requestBody = JSON.stringify(body || {});
+  headers = await attachExecutionRequestAuthHeaders({
+    headers,
+    method: 'POST',
+    targetPath,
+    bodyText: requestBody
+  });
   let lastError = null;
 
   for (let attemptIndex = 0; attemptIndex < EXECUTION_REQUEST_RETRY_DELAYS_MS.length; attemptIndex += 1) {
@@ -1266,7 +1285,7 @@ async function sendExecutionRequest(targetPath, body, executionBaseUrl = EXECUTI
       const response = await fetch(normalizedBaseUrl + targetPath, {
         method: 'POST',
         headers,
-        body: JSON.stringify(body || {}),
+        body: requestBody,
         signal: controller.signal
       });
       const text = await response.text();
