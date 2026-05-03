@@ -1,0 +1,79 @@
+name: ivucx-proof-executor
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan_id:
+        description: Supabase helper_conversion_plans.id
+        required: true
+        type: string
+      helper_job_id:
+        description: Supabase helper_jobs.id
+        required: true
+        type: string
+      operation:
+        description: check / convert / submit
+        required: true
+        type: string
+      helper_base_url:
+        description: Public base URL of the helper API
+        required: true
+        type: string
+      request_id:
+        description: Optional request id for traceability
+        required: false
+        type: string
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Install Coq toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y coq
+
+      - name: Install Lean toolchain
+        shell: bash
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Show runtime versions
+        shell: bash
+        run: |
+          node --version
+          coqc --version
+          lean --version || true
+
+      - name: Execute helper plan
+        env:
+          PLAN_ID: ${{ inputs.plan_id }}
+          HELPER_JOB_ID: ${{ inputs.helper_job_id }}
+          OPERATION: ${{ inputs.operation }}
+          HELPER_BASE_URL: ${{ inputs.helper_base_url }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          HELPER_API_KEY: ${{ secrets.HELPER_API_KEY }}
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LEAN_CMD: lean
+          COQ_CMD: coqc
+          IVUCX_COQ_CMD: coqc
+        run: node scripts/github-execution-worker.mjs

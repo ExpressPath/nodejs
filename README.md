@@ -24,6 +24,9 @@ Railway に載せる軽量 helper API です。
 - `GET /healthz`
 - `GET /api/helper/info`
 - `GET /api/helper/schema-check`
+- `POST /api/lean-check`
+- `POST /api/coq-check`
+- `POST /api/proof-convert`
 - `POST /api/helper/check`
 - `POST /api/helper/submit`
 - `POST /api/helper/convert`
@@ -36,7 +39,9 @@ Railway に載せる軽量 helper API です。
 
 - `NEXT_PUBLIC_SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
-- `EXECUTION_SERVER_BASE_URL`
+- one of:
+  - `EXECUTION_SERVER_BASE_URL`
+  - or `GITHUB_EXECUTION_ENABLED=true` with GitHub executor settings
 
 Accepted aliases:
 
@@ -46,11 +51,18 @@ Accepted aliases:
 Optional:
 
 - `HELPER_API_KEY`
+- `HELPER_PUBLIC_BASE_URL`
 - `EXECUTION_SERVER_API_KEY`
 - `EXECUTION_SERVER_TIMEOUT_MS`
 - `EXECUTION_SERVER_CONVERT_ROUTE`
 - `EXECUTION_SERVER_LEAN_CHECK_ROUTE`
 - `EXECUTION_SERVER_COQ_CHECK_ROUTE`
+- `GITHUB_EXECUTION_TOKEN`
+- `GITHUB_EXECUTION_REPOSITORY`
+- `GITHUB_EXECUTION_WORKFLOW`
+- `GITHUB_EXECUTION_REF`
+- `GITHUB_EXECUTION_SYNC_WAIT_TIMEOUT_MS`
+- `GITHUB_EXECUTION_SYNC_WAIT_POLL_MS`
 - `HELPER_MAX_CODE_BYTES`
 
 ## Supabase Schema
@@ -66,11 +78,78 @@ This now creates:
 - `public.helper_jobs`
 - `public.helper_conversion_plans`
 
+## GitHub Actions Executor
+
+This repository can now replace the old Render execution role with GitHub Actions.
+
+### Repository structure
+
+- `.github/workflows/ivucx-proof-executor.yml`
+  - workflow entrypoint for heavy execution
+- `scripts/github-execution-worker.mjs`
+  - worker that loads a plan from Supabase, runs Lean / Coq / conversion tools, and calls back the helper API
+- `app.js`
+  - planner, job persistence, GitHub workflow dispatch, callback finalization
+- `tools/*.cjs`
+  - typed-lambda / `cic-v1` converters used by the workflow worker
+- `supabase/proof_helper.sql`
+  - durable job / plan / saved problem schema
+
+### Runtime split
+
+- `Vercel`
+  - UI and public entrypoint
+- `Railway helper`
+  - plan creation, Supabase state, GitHub Actions dispatch, callback finalization
+- `GitHub Actions`
+  - Lean / Coq proof check
+  - typed-lambda conversion
+  - `cic-v1` conversion
+
+### Additional env for helper
+
+- `HELPER_PUBLIC_BASE_URL`
+- `GITHUB_EXECUTION_ENABLED`
+- `GITHUB_EXECUTION_TOKEN`
+- `GITHUB_EXECUTION_REPOSITORY`
+- `GITHUB_EXECUTION_WORKFLOW`
+- `GITHUB_EXECUTION_REF`
+
+`GITHUB_EXECUTION_TOKEN` should be able to dispatch workflows in the target repository.
+
+### Required GitHub repository secrets
+
+- `HELPER_API_KEY`
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+
+### Toolchain notes
+
+- The workflow installs `coq` and a standard Lean toolchain automatically.
+- `cic-v1` export may still require extra exporter setup depending on your Lean / Coq environment, especially for `lean4export` or a custom Coq CIC exporter.
+
+### Behavior notes
+
+- When GitHub execution is enabled, heavy execution becomes async-first.
+- `POST /api/helper/check`, `POST /api/helper/convert`, and `POST /api/helper/submit` dispatch GitHub workflows and return helper jobs.
+- The workflow reports back to `POST /api/helper/github-actions/callback`.
+- If `helper_conversion_plans` is missing, the helper still cannot provide durable GitHub-dispatched execution because plans are loaded from Supabase.
+
+### Render-compatible execution routes
+
+- `POST /api/lean-check`
+- `POST /api/coq-check`
+- `POST /api/proof-convert`
+
+These routes let the helper act like the old heavy execution server.
+
+- If `GITHUB_EXECUTION_ENABLED=true`, the helper dispatches GitHub Actions and waits up to `GITHUB_EXECUTION_SYNC_WAIT_TIMEOUT_MS` for completion before replying.
+- If GitHub execution is not enabled, the helper can still proxy to `EXECUTION_SERVER_BASE_URL`.
+- This makes it possible to point Vercel's `EXECUTION_API_BASE_URL` or `EXECUTION_SERVER_BASE_URL` at the helper service while keeping heavy execution off the Vercel runtime.
+
 ## Notes
 
-- Railway helper no longer builds Lean / Coq toolchains.
-- Heavy CIC conversion is intentionally left to Render.
+- Railway helper no longer needs Render or Oracle-server for heavy execution when GitHub Actions is configured.
 - Jobs keep progress metadata so the UI can show short real-time status text.
 - BlueMode client UI may expose only public values like `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY`.
 - The helper planner still needs a server-side service-role key and cannot bootstrap that key from browser state.
-- If `helper_conversion_plans` is missing, the helper now falls back to in-memory planning for the current process, but durable planning still requires the SQL schema.

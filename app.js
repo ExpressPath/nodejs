@@ -6,6 +6,11 @@ import { createClient } from '@supabase/supabase-js';
 import pg from 'pg';
 import { fileURLToPath } from 'url';
 import { attachExecutionRequestAuthHeaders, isLikelyOracleControlPlaneUrl } from './lib/execution-auth.js';
+import {
+  dispatchGitHubExecutionRun,
+  getGitHubExecutionConfig,
+  isGitHubExecutionConfigured
+} from './lib/github-actions.js';
 
 const app = express();
 const { Client: PgClient } = pg;
@@ -24,6 +29,10 @@ const EXECUTION_SERVER_CONVERT_ROUTE = String(process.env.EXECUTION_SERVER_CONVE
 const EXECUTION_SERVER_LEAN_CHECK_ROUTE = String(process.env.EXECUTION_SERVER_LEAN_CHECK_ROUTE || '/api/lean-check').trim();
 const EXECUTION_SERVER_COQ_CHECK_ROUTE = String(process.env.EXECUTION_SERVER_COQ_CHECK_ROUTE || '/api/coq-check').trim();
 const EXECUTION_BASE_URL_HEADER = 'x-ivucx-execution-base-url';
+const HELPER_PUBLIC_BASE_URL = String(process.env.HELPER_PUBLIC_BASE_URL || '').trim().replace(/\/+$/, '');
+const GITHUB_ACTIONS_CALLBACK_ROUTE = '/api/helper/github-actions/callback';
+const GITHUB_EXECUTION_SYNC_WAIT_TIMEOUT_MS = Number(process.env.GITHUB_EXECUTION_SYNC_WAIT_TIMEOUT_MS || 45000);
+const GITHUB_EXECUTION_SYNC_WAIT_POLL_MS = Number(process.env.GITHUB_EXECUTION_SYNC_WAIT_POLL_MS || 1500);
 const HELPER_ALLOWED_ORIGINS = String(
   process.env.HELPER_ALLOWED_ORIGINS
   || 'https://provf.onrender.com,http://localhost:3000,http://127.0.0.1:3000'
@@ -131,7 +140,14 @@ app.get('/', (_req, res) => {
     ok: true,
     service: SERVICE_NAME,
     version: SERVICE_VERSION,
-    routes: ['/healthz', '/api/helper/info', '/api/helper/schema-check']
+    routes: [
+      '/healthz',
+      '/api/helper/info',
+      '/api/helper/schema-check',
+      '/api/lean-check',
+      '/api/coq-check',
+      '/api/proof-convert'
+    ]
   });
 });
 
@@ -172,6 +188,7 @@ app.get('/api/helper/info', (_req, res) => {
   const supabaseEnv = resolveSupabaseEnv();
   const executionInfo = getExecutionInfo(_req);
   const executionConfigured = !!executionInfo.configured;
+  const executionBackend = getExecutionBackendType(executionInfo);
   res.status(200).json({
     ok: true,
     service: SERVICE_NAME,
@@ -198,9 +215,13 @@ app.get('/api/helper/info', (_req, res) => {
     routes: [
       'GET /api/helper/info',
       'GET /api/helper/schema-check',
+      'POST /api/lean-check',
+      'POST /api/coq-check',
+      'POST /api/proof-convert',
       'POST /api/helper/check',
       'POST /api/helper/submit',
       'POST /api/helper/convert',
+      'POST /api/helper/github-actions/callback',
       'GET /api/helper/jobs',
       'GET /api/helper/jobs/:id',
       'GET /api/helper/jobs/:id/result',
@@ -212,15 +233,16 @@ app.get('/api/helper/info', (_req, res) => {
           ? (ENABLE_MEMORY_SCHEMA_FALLBACK ? 'supabase-with-memory-fallback' : 'supabase')
           : 'memory',
         planning: 'railway',
-        proofCheck: executionConfigured ? 'render' : 'unconfigured',
-        conversion: executionConfigured ? 'render' : 'unconfigured'
+        proofCheck: executionConfigured ? executionBackend : 'unconfigured',
+        conversion: executionConfigured ? executionBackend : 'unconfigured'
       },
       conversionRuntimes: {
         typedLambda: buildConversionAvailability(_req),
         cic: buildConversionAvailability(_req)
       }
     },
-    execution: executionInfo
+    execution: executionInfo,
+    githubExecution: getGitHubExecutionConfig()
   });
 });
 
@@ -240,9 +262,59 @@ app.get('/api/helper/schema-check', async (_req, res) => {
   }
 });
 
+app.post('/api/lean-check', async (req, res) => {
+  await handleCompatibilityProofCheck(req, res, 'Lean');
+});
+
+app.post('/api/coq-check', async (req, res) => {
+  await handleCompatibilityProofCheck(req, res, 'Coq');
+});
+
+app.post('/api/proof-convert', async (req, res) => {
+  await handleCompatibilityProofConvert(req, res);
+});
+
 app.post('/api/helper/check', async (req, res) => {
   try {
     const payload = normalizeProofPayload(req.body || {});
+    const wantsAsync = req.body && req.body.async !== false;
+
+    if (isGitHubExecutionConfigured()) {
+      if (wantsAsync) {
+        const job = await createPlannedJob(payload, 'check', req);
+        await dispatchPlannedJob(job.id);
+        const dispatched = await getJob(job.id);
+        res.status(202).json({ ok: true, job: publicJob(dispatched || job) });
+        return;
+      }
+
+      const job = await createPlannedJob(payload, 'check', req);
+      await dispatchPlannedJob(job.id);
+      const finalJob = await waitForJobTerminalState(job.id);
+      if (!finalJob) {
+        res.status(504).json({
+          ok: false,
+          error: 'GitHub Actions proof check did not finish within the sync wait timeout.',
+          job: publicJob(job)
+        });
+        return;
+      }
+
+      const verification = finalJob.result && finalJob.result.verification
+        ? finalJob.result.verification
+        : {
+          ok: false,
+          timedOut: false,
+          error: finalJob.error && finalJob.error.message
+            ? finalJob.error.message
+            : 'GitHub Actions proof check failed.',
+          source: 'github-actions',
+          proofState: normalizeProofState(analyzeProofState(payload.language, payload.code).proofState) || 'NN'
+        };
+      res.status(statusCodeForVerification(verification)).json({ ok: Boolean(verification.ok), verification });
+      return;
+    }
+
     const verification = await requestExecutionCheck(payload, req);
     res.status(statusCodeForVerification(verification)).json({ ok: verification.ok, verification });
   } catch (err) {
@@ -261,6 +333,18 @@ app.post('/api/helper/convert', async (req, res) => {
   await handlePlannedRequest(req, res, 'convert');
 });
 
+app.post(GITHUB_ACTIONS_CALLBACK_ROUTE, async (req, res) => {
+  try {
+    await handleGitHubActionsCallback(req.body || {});
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    res.status(err && err.statusCode ? err.statusCode : 400).json({
+      ok: false,
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+});
+
 app.get('/api/helper/jobs', async (_req, res) => {
   try {
     const list = await listJobs();
@@ -276,11 +360,17 @@ app.get('/api/helper/jobs/:id/result', async (req, res) => {
     res.status(404).json({ ok: false, error: 'Helper job not found.' });
     return;
   }
-  if (job.status !== JOB_STATUS.SUCCEEDED) {
+  if (job.status === JOB_STATUS.QUEUED || job.status === JOB_STATUS.RUNNING) {
     res.status(409).json({ ok: false, error: 'Helper job is not finished yet.', job: publicJob(job) });
     return;
   }
-  res.status(200).json({ ok: true, result: job.result });
+  res.status(200).json({
+    ok: job.status === JOB_STATUS.SUCCEEDED,
+    status: job.status,
+    result: job.result || null,
+    error: job.status === JOB_STATUS.FAILED ? (job.error || null) : null,
+    job: publicJob(job)
+  });
 });
 
 app.get('/api/helper/jobs/:id', async (req, res) => {
@@ -326,26 +416,28 @@ startServer().catch((err) => {
 });
 
 function getRoleInfo() {
+  const executionInfo = getExecutionInfo();
   return {
     stateStore: 'supabase',
     planner: 'railway',
-    executor: 'render'
+    executor: getExecutionBackendType(executionInfo)
   };
 }
 
 function buildConversionAvailability(req) {
-  const executionBaseUrl = resolveExecutionBaseUrlFromRequest(req);
+  const executionInfo = getExecutionInfo(req);
+  const backend = getExecutionBackendType(executionInfo);
   return {
     lean: {
-      available: !!executionBaseUrl,
+      available: !!executionInfo.configured,
       planner: 'railway',
-      executor: executionBaseUrl ? 'render' : 'unconfigured',
+      executor: executionInfo.configured ? backend : 'unconfigured',
       stateStore: 'supabase'
     },
     coq: {
-      available: !!executionBaseUrl,
+      available: !!executionInfo.configured,
       planner: 'railway',
-      executor: executionBaseUrl ? 'render' : 'unconfigured',
+      executor: executionInfo.configured ? backend : 'unconfigured',
       stateStore: 'supabase'
     }
   };
@@ -369,6 +461,18 @@ function normalizeRemoteBaseUrl(value) {
   return normalized.replace(/\/+$/, '');
 }
 
+function inferPublicBaseUrlFromRequest(req) {
+  const forwardedProto = firstNonEmptyHeaderValue(req?.headers?.['x-forwarded-proto']);
+  const forwardedHost = firstNonEmptyHeaderValue(req?.headers?.['x-forwarded-host']);
+  const host = forwardedHost || firstNonEmptyHeaderValue(req?.headers?.host);
+  if (!host) {
+    return '';
+  }
+
+  const protocol = forwardedProto || 'https';
+  return normalizeRemoteBaseUrl(`${protocol}://${host}`);
+}
+
 function resolveExecutionBaseUrlFromRequest(req) {
   const forwarded = req && req.headers
     ? (
@@ -388,23 +492,68 @@ function resolveExecutionBaseUrlFromPlan(plan) {
   );
 }
 
+function resolveHelperPublicBaseUrl(reqOrPlan = null) {
+  if (HELPER_PUBLIC_BASE_URL) {
+    return HELPER_PUBLIC_BASE_URL;
+  }
+
+  if (reqOrPlan && reqOrPlan.headers) {
+    return inferPublicBaseUrlFromRequest(reqOrPlan);
+  }
+
+  return normalizeRemoteBaseUrl(
+    reqOrPlan?.requestMeta?.helperBaseUrl
+    || reqOrPlan?.executionPayload?.helperBaseUrl
+    || ''
+  );
+}
+
+function getExecutionBackendType(executionInfo = null) {
+  if (isGitHubExecutionConfigured()) {
+    return 'github-actions';
+  }
+
+  if (executionInfo && executionInfo.configured && executionInfo.baseUrl) {
+    return 'execution-server';
+  }
+
+  return 'unconfigured';
+}
+
 function getExecutionInfo(reqOrPlan = null) {
   const baseUrl = reqOrPlan && reqOrPlan.headers
     ? resolveExecutionBaseUrlFromRequest(reqOrPlan)
     : resolveExecutionBaseUrlFromPlan(reqOrPlan);
+  const github = getGitHubExecutionConfig();
+  const githubConfigured = isGitHubExecutionConfigured();
+  const helperBaseUrl = resolveHelperPublicBaseUrl(reqOrPlan);
+  const configured = githubConfigured || !!baseUrl;
+  const backend = githubConfigured ? 'github-actions' : (baseUrl ? 'execution-server' : 'unconfigured');
+  const warning = isLikelyOracleControlPlaneUrl(baseUrl)
+    ? 'Configured execution URL looks like the Oracle Cloud control-plane endpoint, not the Oracle-server app URL.'
+    : (
+      githubConfigured && !helperBaseUrl
+        ? 'GitHub Actions execution is enabled, but HELPER_PUBLIC_BASE_URL could not be resolved for workflow callbacks.'
+        : null
+    );
   return {
-    configured: !!baseUrl,
+    configured,
+    backend,
     baseUrl: baseUrl || null,
-    source: baseUrl
+    source: githubConfigured
+      ? 'github-actions'
+      : (
+        baseUrl
       ? (normalizeRemoteBaseUrl(EXECUTION_SERVER_BASE_URL) === baseUrl ? 'helper-env' : 'request-bridge')
-      : 'unconfigured',
+          : 'unconfigured'
+      ),
     convertRoute: EXECUTION_SERVER_CONVERT_ROUTE,
     leanCheckRoute: EXECUTION_SERVER_LEAN_CHECK_ROUTE,
     coqCheckRoute: EXECUTION_SERVER_COQ_CHECK_ROUTE,
     timeoutMs: EXECUTION_SERVER_TIMEOUT_MS,
-    warning: isLikelyOracleControlPlaneUrl(baseUrl)
-      ? 'Configured execution URL looks like the Oracle Cloud control-plane endpoint, not the Oracle-server app URL.'
-      : null
+    helperBaseUrl: helperBaseUrl || null,
+    github,
+    warning
   };
 }
 
@@ -821,16 +970,50 @@ function publicJob(job) {
     createdAt: job.createdAt,
     startedAt: job.startedAt,
     completedAt: job.completedAt,
-    result: job.status === JOB_STATUS.SUCCEEDED ? job.result : null,
+    result: job.result || null,
     error: job.status === JOB_STATUS.FAILED ? job.error : null,
     problemId: job.problemId || null
   };
+}
+
+function defaultRequestedFormat(operation, payload) {
+  const requested = typeof payload?.format === 'string' ? payload.format.trim() : '';
+  if (requested) {
+    return requested;
+  }
+  return String(operation || '').trim().toLowerCase() === 'check' ? 'proof-check-v1' : 'typed-lambda-v1';
 }
 
 async function handlePlannedRequest(req, res, operation) {
   try {
     const payload = normalizeProofPayload(req.body || {});
     const wantsAsync = req.body && req.body.async !== false;
+
+    if (isGitHubExecutionConfigured()) {
+      if (!wantsAsync) {
+        const job = await createPlannedJob(payload, operation, req);
+        await dispatchPlannedJob(job.id);
+        const finalJob = await waitForJobTerminalState(job.id);
+        if (!finalJob) {
+          res.status(504).json({
+            ok: false,
+            error: 'GitHub Actions conversion did not finish within the sync wait timeout.',
+            job: publicJob(job)
+          });
+          return;
+        }
+
+        const finalResult = finalJob.result || buildGitHubExecutionFailureResult(finalJob, payload, operation);
+        res.status(statusCodeForResult(finalResult)).json({ ok: Boolean(finalResult.ok), result: finalResult });
+        return;
+      }
+
+      const job = await createPlannedJob(payload, operation, req);
+      await dispatchPlannedJob(job.id);
+      const dispatched = await getJob(job.id);
+      res.status(202).json({ ok: true, job: publicJob(dispatched || job) });
+      return;
+    }
 
     if (!wantsAsync) {
       const plan = await createConversionPlan(payload, operation, null, req);
@@ -840,13 +1023,9 @@ async function handlePlannedRequest(req, res, operation) {
     }
 
     const job = await createPlannedJob(payload, operation, req);
-    res.status(202).json({ ok: true, job: publicJob(job) });
-
-    queueMicrotask(() => {
-      executeJob(job.id).catch((err) => {
-        console.error('helper job failed', err);
-      });
-    });
+    await dispatchPlannedJob(job.id);
+    const dispatched = await getJob(job.id);
+    res.status(202).json({ ok: true, job: publicJob(dispatched || job) });
   } catch (err) {
     res.status(err && err.statusCode ? err.statusCode : 400).json({
       ok: false,
@@ -855,7 +1034,112 @@ async function handlePlannedRequest(req, res, operation) {
   }
 }
 
+async function handleCompatibilityProofCheck(req, res, language) {
+  try {
+    const payload = normalizeProofPayload({
+      ...(req.body || {}),
+      language
+    });
+
+    if (isGitHubExecutionConfigured()) {
+      const job = await createPlannedJob(payload, 'check', req);
+      await dispatchPlannedJob(job.id);
+      const finalJob = await waitForJobTerminalState(job.id);
+
+      if (!finalJob) {
+        res.status(504).json({
+          ok: false,
+          status: 'timeout',
+          error: 'GitHub Actions proof check did not finish within the sync wait timeout.',
+          job: publicJob(job)
+        });
+        return;
+      }
+
+      const verification = finalJob.result && finalJob.result.verification
+        ? finalJob.result.verification
+        : {
+          ok: false,
+          timedOut: false,
+          error: finalJob.error && finalJob.error.message
+            ? finalJob.error.message
+            : 'GitHub Actions proof check failed.',
+          source: 'github-actions',
+          proofState: normalizeProofState(analyzeProofState(payload.language, payload.code).proofState) || 'NN'
+        };
+      const legacy = toLegacyProofCheckBody(verification);
+      res.status(statusCodeForVerification(verification)).json(legacy);
+      return;
+    }
+
+    ensureExternalExecutionProxyTarget(req);
+    const upstream = await sendExecutionRequest(
+      language === 'Coq' ? EXECUTION_SERVER_COQ_CHECK_ROUTE : EXECUTION_SERVER_LEAN_CHECK_ROUTE,
+      {
+        code: payload.code,
+        fileName: payload.fileName
+      },
+      getExecutionInfo(req).baseUrl
+    );
+    forwardExecutionResponse(res, upstream);
+  } catch (err) {
+    const statusCode = err && err.statusCode ? err.statusCode : 400;
+    res.status(statusCode).json({
+      ok: false,
+      status: statusCode === 504 ? 'timeout' : 'error',
+      error: err && err.message ? err.message : String(err)
+    });
+  }
+}
+
+async function handleCompatibilityProofConvert(req, res) {
+  try {
+    if (isGitHubExecutionConfigured()) {
+      const body = req.body && typeof req.body === 'object' ? req.body : {};
+      const payload = await normalizeCompatibilityConvertPayload(body);
+      const job = payload.planId && !payload.code
+        ? await createJobForExistingPlan(await requirePlan(payload.planId), req, 'convert')
+        : await createPlannedJob(payload, 'convert', req);
+
+      await dispatchPlannedJob(job.id);
+      const finalJob = await waitForJobTerminalState(job.id);
+
+      if (!finalJob) {
+        res.status(504).json({
+          success: false,
+          error: 'GitHub Actions conversion did not finish within the sync wait timeout.',
+          job: publicJob(job)
+        });
+        return;
+      }
+
+      const finalResult = finalJob.result || buildGitHubExecutionFailureResult(finalJob, payload, 'convert');
+      res.status(statusCodeForResult(finalResult)).json({
+        success: Boolean(finalResult.ok),
+        result: finalResult
+      });
+      return;
+    }
+
+    ensureExternalExecutionProxyTarget(req);
+    const upstream = await sendExecutionRequest(
+      EXECUTION_SERVER_CONVERT_ROUTE,
+      req.body || {},
+      getExecutionInfo(req).baseUrl
+    );
+    forwardExecutionResponse(res, upstream);
+  } catch (err) {
+    const statusCode = err && err.statusCode ? err.statusCode : 400;
+    res.status(statusCode).json({
+      success: false,
+      error: err && err.message ? err.message : String(err),
+      details: err && err.details ? err.details : null
+    });
+  }
+}
+
 async function createPlannedJob(payload, operation, req) {
+  const requestedFormat = defaultRequestedFormat(operation, payload);
   const job = {
     id: randomUUID(),
     status: JOB_STATUS.QUEUED,
@@ -863,7 +1147,7 @@ async function createPlannedJob(payload, operation, req) {
     title: payload.title,
     language: payload.language,
     fileName: payload.fileName,
-    format: payload.format,
+    format: requestedFormat,
     sourceSha256: sha256(payload.code),
     createdAt: nowIso(),
     startedAt: null,
@@ -881,6 +1165,31 @@ async function createPlannedJob(payload, operation, req) {
   return job;
 }
 
+async function createJobForExistingPlan(plan, req, operation = 'convert') {
+  const job = {
+    id: randomUUID(),
+    status: JOB_STATUS.QUEUED,
+    operation: operation || plan.operation || 'convert',
+    title: plan.title || '',
+    language: plan.language || 'Lean',
+    fileName: plan.fileName || defaultFileName(plan.language || 'Lean'),
+    format: plan.requestedFormat || 'typed-lambda-v1',
+    sourceSha256: plan.sourceSha256 || sha256(plan.sourceCode || ''),
+    createdAt: nowIso(),
+    startedAt: null,
+    completedAt: null,
+    progress: createProgress(10, 'planning', 'Planning'),
+    result: null,
+    error: null,
+    problemId: null,
+    planId: plan.id
+  };
+
+  await persistJob(job);
+  jobs.set(job.id, job);
+  return job;
+}
+
 async function createConversionPlan(payload, operation, helperJobId, req) {
   const { client, error } = getSupabaseAdmin();
   if (!client) {
@@ -892,6 +1201,8 @@ async function createConversionPlan(payload, operation, helperJobId, req) {
   const closure = analyzeProofState(payload.language, payload.code);
   const createdAt = nowIso();
   const executionInfo = getExecutionInfo(req);
+  const executionBackend = getExecutionBackendType(executionInfo);
+  const requestedFormat = defaultRequestedFormat(operation, payload);
 
   const plan = {
     id: randomUUID(),
@@ -901,7 +1212,7 @@ async function createConversionPlan(payload, operation, helperJobId, req) {
     title: payload.title || '',
     language: payload.language,
     fileName: payload.fileName,
-    requestedFormat: payload.format || 'typed-lambda-v1',
+    requestedFormat,
     verify: payload.verify !== false,
     sourceCode: payload.code,
     sourceSha256,
@@ -912,10 +1223,10 @@ async function createConversionPlan(payload, operation, helperJobId, req) {
       schema: 'ivucx-conversion-plan-v1',
       stateStore: 'supabase',
       planner: 'railway',
-      executor: 'render',
+      executor: executionBackend,
       operation,
-      requestedFormat: payload.format || 'typed-lambda-v1',
-      fallbackFormat: String(payload.format || '').trim().toLowerCase() === 'cic-v1' ? 'typed-lambda-v1' : null,
+      requestedFormat,
+      fallbackFormat: String(requestedFormat || '').trim().toLowerCase() === 'cic-v1' ? 'typed-lambda-v1' : null,
       sourceBytes,
       sourceSha256,
       language: payload.language.toLowerCase(),
@@ -927,16 +1238,19 @@ async function createConversionPlan(payload, operation, helperJobId, req) {
       },
       execution: {
         baseUrl: executionInfo.baseUrl,
-        source: executionInfo.source
+        source: executionInfo.source,
+        backend: executionBackend,
+        github: executionInfo.github && executionInfo.github.enabled ? executionInfo.github : null
       }
     },
     progress: createProgress(12, 'planning', 'Planning'),
     executionPayload: {
       language: payload.language,
       fileName: payload.fileName,
-      format: payload.format || 'typed-lambda-v1',
+      format: requestedFormat,
       verify: payload.verify !== false,
       executionBaseUrl: executionInfo.baseUrl,
+      helperBaseUrl: executionInfo.helperBaseUrl,
       sourceSha256,
       sourceBytes
     },
@@ -945,8 +1259,11 @@ async function createConversionPlan(payload, operation, helperJobId, req) {
     requestMeta: {
       sourceBytes,
       createdBy: 'railway-helper',
+      requestId: req && req.id ? req.id : null,
       executionBaseUrl: executionInfo.baseUrl,
       executionSource: executionInfo.source,
+      executionBackend,
+      helperBaseUrl: executionInfo.helperBaseUrl,
       helperJobId: helperJobId || null
     },
     createdAt,
@@ -957,6 +1274,97 @@ async function createConversionPlan(payload, operation, helperJobId, req) {
 
   await persistPlan(plan);
   return plan;
+}
+
+async function dispatchPlannedJob(jobId) {
+  const job = await getJob(jobId);
+  if (!job || job.status !== JOB_STATUS.QUEUED) {
+    return job;
+  }
+
+  if (isGitHubExecutionConfigured()) {
+    const plan = await getPlan(job.planId);
+    if (!plan) {
+      throw new Error('Conversion plan not found in Supabase. Run supabase/proof_helper.sql again.');
+    }
+
+    job.status = JOB_STATUS.RUNNING;
+    job.startedAt = nowIso();
+    job.progress = createProgress(24, 'dispatching', 'Dispatching to GitHub Actions');
+    await persistJob(job);
+
+    await updatePlanProgress(plan.id, PLAN_STATUS.RUNNING, createProgress(28, 'dispatching', 'Dispatching to GitHub Actions'));
+
+    try {
+      await dispatchGitHubPlannedJob(job, plan);
+    } catch (error) {
+      const message = error && error.message ? error.message : String(error);
+      await completeGitHubJobFailure(plan, job, message);
+      throw error;
+    }
+
+    return getJob(job.id);
+  }
+
+  queueMicrotask(() => {
+    executeJob(job.id).catch((err) => {
+      console.error('helper job failed', err);
+    });
+  });
+
+  return job;
+}
+
+function isTerminalJobStatus(status) {
+  return status === JOB_STATUS.SUCCEEDED || status === JOB_STATUS.FAILED;
+}
+
+function waitForDuration(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function waitForJobTerminalState(jobId, options = {}) {
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs || GITHUB_EXECUTION_SYNC_WAIT_TIMEOUT_MS) || GITHUB_EXECUTION_SYNC_WAIT_TIMEOUT_MS);
+  const pollMs = Math.max(250, Number(options.pollMs || GITHUB_EXECUTION_SYNC_WAIT_POLL_MS) || GITHUB_EXECUTION_SYNC_WAIT_POLL_MS);
+  const deadline = Date.now() + timeoutMs;
+  let latest = null;
+
+  while (Date.now() <= deadline) {
+    latest = await getJob(jobId);
+    if (!latest) {
+      return null;
+    }
+    if (isTerminalJobStatus(latest.status)) {
+      return latest;
+    }
+    await waitForDuration(pollMs);
+  }
+
+  return latest && isTerminalJobStatus(latest.status) ? latest : null;
+}
+
+async function dispatchGitHubPlannedJob(job, plan) {
+  const helperBaseUrl = resolveHelperPublicBaseUrl(plan);
+  if (!helperBaseUrl) {
+    const error = new Error(
+      'No helper public base URL is available for GitHub Actions callbacks. Set HELPER_PUBLIC_BASE_URL.'
+    );
+    error.statusCode = 503;
+    throw error;
+  }
+
+  await dispatchGitHubExecutionRun({
+    helperJobId: job.id,
+    planId: plan.id,
+    operation: plan.operation,
+    helperBaseUrl,
+    requestId: plan.requestMeta && plan.requestMeta.requestId ? plan.requestMeta.requestId : ''
+  });
+
+  job.progress = createProgress(36, 'queued', 'Queued on GitHub Actions');
+  await persistJob(job);
+
+  await updatePlanProgress(plan.id, PLAN_STATUS.RUNNING, createProgress(38, 'queued', 'Queued on GitHub Actions'));
 }
 
 async function executeJob(jobId) {
@@ -974,6 +1382,11 @@ async function executeJob(jobId) {
       throw new Error('Conversion plan not found in Supabase. Run supabase/proof_helper.sql again.');
     }
 
+    if (isGitHubExecutionConfigured()) {
+      await dispatchGitHubPlannedJob(job, plan);
+      return;
+    }
+
     const result = await executePlannedOperation(plan, job);
     job.completedAt = nowIso();
 
@@ -984,6 +1397,7 @@ async function executeJob(jobId) {
       job.progress = createProgress(100, 'saved', result.problemId ? 'Problem saved' : 'Converted');
     } else {
       job.status = JOB_STATUS.FAILED;
+      job.result = result;
       job.error = buildJobError(result);
       job.progress = createProgress(100, 'failed', job.error.message || 'Conversion failed');
     }
@@ -1042,7 +1456,7 @@ async function executePlannedOperation(plan, job) {
     operation: currentPlan.operation,
     stateStore: 'supabase',
     planner: 'railway',
-    executor: 'render',
+    executor: 'execution-server',
     requestedFormat: currentPlan.requestedFormat,
     completedFormat,
     fallbackUsed
@@ -1088,17 +1502,381 @@ async function executePlannedOperation(plan, job) {
   return finalResult;
 }
 
-async function executeRemoteConversion(plan, format) {
-  const executionInfo = getExecutionInfo(plan);
+async function handleGitHubActionsCallback(body) {
+  const planId = String(body.planId || '').trim();
+  const helperJobId = String(body.helperJobId || '').trim();
+  const operation = String(body.operation || '').trim().toLowerCase();
+
+  if (!planId || !helperJobId || !operation) {
+    const error = new Error('planId, helperJobId, and operation are required');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const plan = await getPlan(planId);
+  if (!plan) {
+    const error = new Error('Conversion plan not found in Supabase.');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const job = await getJob(helperJobId);
+  if (!job) {
+    const error = new Error('Helper job not found.');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  if (operation === 'check') {
+    await finalizeGitHubCheckCallback(plan, job, body);
+    return;
+  }
+
+  await finalizeGitHubConversionCallback(plan, job, body);
+}
+
+async function finalizeGitHubCheckCallback(plan, job, body) {
+  const verification = body.verification && typeof body.verification === 'object'
+    ? body.verification
+    : (
+      body.result && typeof body.result === 'object' && body.result.verification && typeof body.result.verification === 'object'
+        ? body.result.verification
+        : null
+    );
+
+  if (!verification) {
+    const message = extractGitHubCallbackError(body) || 'GitHub Actions proof check did not return a verification payload.';
+    await completeGitHubJobFailure(plan, job, message);
+    return;
+  }
+
+  const normalizedVerification = {
+    ...verification,
+    source: 'github-actions',
+    proofState: normalizeProofState(analyzeProofState(plan.language, plan.sourceCode).proofState) || 'NN'
+  };
+
+  const resultPayload = {
+    ok: Boolean(normalizedVerification.ok),
+    verification: normalizedVerification
+  };
+
+  if (!normalizedVerification.ok) {
+    const message = extractVerificationMessage(normalizedVerification);
+    job.result = resultPayload;
+    await persistExecutionOutcome(plan.id, {
+      status: PLAN_STATUS.FAILED,
+      progress: createProgress(100, 'failed', message),
+      result: resultPayload,
+      error: {
+        message,
+        stage: 'proof-check',
+        httpStatus: normalizedVerification.upstreamStatus || normalizedVerification.httpStatus || 422,
+        timedOut: !!normalizedVerification.timedOut
+      },
+      proofState: normalizedVerification.proofState,
+      verificationStatus: resolveVerificationStatus(resultPayload),
+      problemId: null,
+      completedAt: nowIso()
+    });
+
+    job.status = JOB_STATUS.FAILED;
+    job.completedAt = nowIso();
+    job.error = { message };
+    job.progress = createProgress(100, 'failed', message);
+    await persistJob(job);
+    return;
+  }
+
+  await persistExecutionOutcome(plan.id, {
+    status: PLAN_STATUS.SUCCEEDED,
+    progress: createProgress(100, 'checked', 'Proof checked'),
+    result: resultPayload,
+    error: null,
+    proofState: normalizedVerification.proofState,
+    verificationStatus: resolveVerificationStatus(resultPayload),
+    problemId: null,
+    completedAt: nowIso()
+  });
+
+  job.status = JOB_STATUS.SUCCEEDED;
+  job.completedAt = nowIso();
+  job.result = resultPayload;
+  job.error = null;
+  job.progress = createProgress(100, 'checked', 'Proof checked');
+  await persistJob(job);
+}
+
+async function finalizeGitHubConversionCallback(plan, job, body) {
+  const completedFormat = String(body.completedFormat || '').trim() || plan.requestedFormat;
+  const fallbackUsed = Boolean(body.fallbackUsed);
+  const workflowMeta = body.workflow && typeof body.workflow === 'object' ? body.workflow : null;
+
+  let finalResult = body.result && typeof body.result === 'object'
+    ? { ...body.result }
+    : null;
+
+  if (!finalResult) {
+    finalResult = {
+      ok: false,
+      stage: 'conversion',
+      timedOut: false,
+      httpStatus: 502,
+      language: plan.language.toLowerCase(),
+      verifyBeforeConvert: plan.verify,
+      proofCheck: null,
+      conversion: {
+        ok: false,
+        language: plan.language.toLowerCase(),
+        targetFamily: String(completedFormat || '').trim().toLowerCase() === 'cic-v1' ? 'cic' : 'typed-lambda',
+        requestedFormat: plan.requestedFormat,
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        durationMs: null,
+        codeBytes: Buffer.byteLength(plan.sourceCode || '', 'utf8'),
+        codeHash: plan.sourceSha256,
+        stdout: '',
+        stderr: extractGitHubCallbackError(body),
+        lambda: {
+          format: completedFormat,
+          error: extractGitHubCallbackError(body)
+        }
+      }
+    };
+  }
+
+  const proofState = resolveStoredProofState(plan.language, plan.sourceCode, finalResult);
+  finalResult.proofState = proofState;
+  finalResult.planning = {
+    planId: plan.id,
+    operation: plan.operation,
+    stateStore: 'supabase',
+    planner: 'railway',
+    executor: 'github-actions',
+    requestedFormat: plan.requestedFormat,
+    completedFormat,
+    fallbackUsed,
+    workflow: workflowMeta
+  };
+
+  if (!finalResult.ok) {
+    const message = extractResultMessage(finalResult);
+    job.result = finalResult;
+    await persistExecutionOutcome(plan.id, {
+      status: PLAN_STATUS.FAILED,
+      progress: createProgress(100, 'failed', message),
+      result: finalResult,
+      error: buildExecutionErrorObject(finalResult),
+      proofState,
+      verificationStatus: resolveVerificationStatus(finalResult),
+      problemId: null,
+      completedAt: nowIso()
+    });
+
+    job.status = JOB_STATUS.FAILED;
+    job.completedAt = nowIso();
+    job.error = buildJobError(finalResult);
+    job.progress = createProgress(100, 'failed', job.error.message || 'Conversion failed');
+    await persistJob(job);
+    return;
+  }
+
+  let problemId = null;
+  if (plan.operation === 'submit') {
+    const saved = await saveProblemRecord(plan, finalResult, proofState, completedFormat);
+    problemId = saved.id || null;
+    finalResult.problemId = problemId;
+  }
+
+  await persistExecutionOutcome(plan.id, {
+    status: PLAN_STATUS.SUCCEEDED,
+    progress: createProgress(100, 'saved', problemId ? 'Problem saved' : 'Converted'),
+    result: finalResult,
+    error: null,
+    proofState,
+    verificationStatus: resolveVerificationStatus(finalResult),
+    problemId,
+    completedAt: nowIso()
+  });
+
+  job.status = JOB_STATUS.SUCCEEDED;
+  job.completedAt = nowIso();
+  job.result = finalResult;
+  job.error = null;
+  job.problemId = problemId || null;
+  job.progress = createProgress(100, 'saved', problemId ? 'Problem saved' : 'Converted');
+  await persistJob(job);
+}
+
+async function completeGitHubJobFailure(plan, job, message) {
+  await markPlanFailed(plan.id, message, createProgress(100, 'failed', message));
+  job.status = JOB_STATUS.FAILED;
+  job.completedAt = nowIso();
+  job.error = { message };
+  job.progress = createProgress(100, 'failed', message);
+  await persistJob(job);
+}
+
+function extractGitHubCallbackError(body) {
+  if (body && typeof body === 'object') {
+    if (typeof body.error === 'string' && body.error.trim()) {
+      return body.error.trim();
+    }
+    if (body.error && typeof body.error === 'object' && typeof body.error.message === 'string' && body.error.message.trim()) {
+      return body.error.message.trim();
+    }
+  }
+
+  return 'GitHub Actions execution failed.';
+}
+
+function extractVerificationMessage(verification) {
+  if (!verification || typeof verification !== 'object') {
+    return 'Proof check failed.';
+  }
+
+  if (typeof verification.error === 'string' && verification.error.trim()) {
+    return verification.error.trim();
+  }
+  if (typeof verification.stderr === 'string' && verification.stderr.trim()) {
+    return verification.stderr.trim();
+  }
+  if (typeof verification.stdout === 'string' && verification.stdout.trim()) {
+    return verification.stdout.trim();
+  }
+
+  return 'Proof check failed.';
+}
+
+function toLegacyProofCheckBody(verification) {
+  const normalized = verification && typeof verification === 'object' ? verification : {};
+  const body = {
+    ok: Boolean(normalized.ok),
+    status: normalized.timedOut ? 'timeout' : (normalized.ok ? 'ok' : 'error'),
+    exitCode: typeof normalized.exitCode === 'number' ? normalized.exitCode : null,
+    signal: normalized.signal || null,
+    durationMs: typeof normalized.durationMs === 'number' ? normalized.durationMs : null,
+    stdout: typeof normalized.stdout === 'string' ? normalized.stdout : '',
+    stderr: typeof normalized.stderr === 'string' ? normalized.stderr : ''
+  };
+  if (typeof normalized.error === 'string' && normalized.error.trim()) {
+    body.error = normalized.error.trim();
+  }
+  return body;
+}
+
+function ensureExternalExecutionProxyTarget(req) {
+  const executionInfo = getExecutionInfo(req);
   if (!executionInfo.configured || !executionInfo.baseUrl) {
     const error = new Error(
-      'No execution server base URL is available on the helper server. Set EXECUTION_SERVER_BASE_URL or call through the Render app proxy.'
+      'No execution server base URL is available on the helper server. Set EXECUTION_SERVER_BASE_URL or enable GitHub Actions execution.'
     );
     error.statusCode = 503;
     throw error;
   }
 
-  await updatePlanProgress(plan.id, PLAN_STATUS.RUNNING, createProgress(46, 'running', 'Running on Render'));
+  const helperBaseUrl = resolveHelperPublicBaseUrl(req);
+  if (helperBaseUrl && normalizeRemoteBaseUrl(helperBaseUrl) === normalizeRemoteBaseUrl(executionInfo.baseUrl)) {
+    const error = new Error(
+      'EXECUTION_SERVER_BASE_URL points back to this helper service. Point it at a separate execution API or enable GitHub Actions execution.'
+    );
+    error.statusCode = 503;
+    throw error;
+  }
+}
+
+function forwardExecutionResponse(res, upstream) {
+  const payload = upstream && upstream.payload && typeof upstream.payload === 'object'
+    ? upstream.payload
+    : null;
+  if (payload) {
+    res.status(upstream.status || 200).json(payload);
+    return;
+  }
+  res
+    .status(upstream && upstream.status ? upstream.status : 502)
+    .type('application/json')
+    .send(upstream && typeof upstream.text === 'string' ? upstream.text : JSON.stringify({ ok: false, error: 'Invalid execution response.' }));
+}
+
+async function requirePlan(planId) {
+  const plan = await getPlan(planId);
+  if (!plan) {
+    const error = new Error('Conversion plan not found in Supabase.');
+    error.statusCode = 404;
+    throw error;
+  }
+  return plan;
+}
+
+async function normalizeCompatibilityConvertPayload(body) {
+  const normalizedBody = body && typeof body === 'object' ? body : {};
+  const planId = typeof normalizedBody.planId === 'string' ? normalizedBody.planId.trim() : '';
+  const hasInlineCode = typeof normalizedBody.code === 'string' && normalizedBody.code.trim();
+
+  if (planId && !hasInlineCode) {
+    return {
+      planId
+    };
+  }
+
+  return normalizeProofPayload(normalizedBody);
+}
+
+function buildGitHubExecutionFailureResult(job, payload, operation = 'convert') {
+  const message = job && job.error && job.error.message
+    ? job.error.message
+    : 'GitHub Actions execution failed.';
+  const requestedFormat = defaultRequestedFormat(operation, payload || {});
+  return {
+    ok: false,
+    stage: operation === 'check' ? 'proof-check' : 'conversion',
+    timedOut: false,
+    httpStatus: 502,
+    language: payload && payload.language ? String(payload.language).toLowerCase() : null,
+    verifyBeforeConvert: payload && Object.prototype.hasOwnProperty.call(payload, 'verify') ? payload.verify !== false : true,
+    proofCheck: operation === 'check'
+      ? {
+        ok: false,
+        error: message,
+        source: 'github-actions'
+      }
+      : null,
+    conversion: operation === 'check'
+      ? null
+      : {
+        ok: false,
+        language: payload && payload.language ? String(payload.language).toLowerCase() : null,
+        targetFamily: String(requestedFormat).toLowerCase() === 'cic-v1' ? 'cic' : 'typed-lambda',
+        requestedFormat,
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        durationMs: null,
+        codeBytes: payload && typeof payload.code === 'string' ? Buffer.byteLength(payload.code, 'utf8') : null,
+        codeHash: payload && typeof payload.code === 'string' ? sha256(payload.code) : null,
+        stdout: '',
+        stderr: message,
+        lambda: {
+          format: requestedFormat,
+          error: message
+        }
+      }
+  };
+}
+
+async function executeRemoteConversion(plan, format) {
+  const executionInfo = getExecutionInfo(plan);
+  if (!executionInfo.configured || !executionInfo.baseUrl) {
+    const error = new Error(
+      'No execution server base URL is available on the helper server. Set EXECUTION_SERVER_BASE_URL or switch to GitHub Actions execution.'
+    );
+    error.statusCode = 503;
+    throw error;
+  }
+
+  await updatePlanProgress(plan.id, PLAN_STATUS.RUNNING, createProgress(46, 'running', 'Running on execution server'));
 
   const executionPayload = {
     planId: plan.id,
@@ -1177,7 +1955,7 @@ async function requestExecutionCheck(payload, req) {
   const executionInfo = getExecutionInfo(req);
   if (!executionInfo.configured || !executionInfo.baseUrl) {
     const error = new Error(
-      'No execution server base URL is available on the helper server. Set EXECUTION_SERVER_BASE_URL or call through the Render app proxy.'
+      'No execution server base URL is available on the helper server. Set EXECUTION_SERVER_BASE_URL or use async GitHub Actions execution.'
     );
     error.statusCode = 503;
     throw error;
@@ -1202,7 +1980,7 @@ async function requestExecutionCheck(payload, req) {
     stderr: typeof body.stderr === 'string' ? truncateOutput(body.stderr) : '',
     error: typeof body.error === 'string' ? body.error : '',
     upstreamStatus: upstream.status,
-    source: 'render-execution',
+    source: 'execution-server',
     proofState: normalizeProofState(analyzeProofState(payload.language, payload.code).proofState) || 'NN'
   };
 }
@@ -1354,6 +2132,9 @@ async function saveProblemRecord(plan, result, proofState, completedFormat) {
   const lambda = conversion.lambda && typeof conversion.lambda === 'object'
     ? conversion.lambda
     : {};
+  const executorName = result && result.planning && result.planning.executor
+    ? String(result.planning.executor)
+    : 'execution-server';
 
   const record = {
     title: plan.title || '',
@@ -1369,10 +2150,10 @@ async function saveProblemRecord(plan, result, proofState, completedFormat) {
     },
     normalized_format: lambda.format || completedFormat || plan.requestedFormat,
     normalized_term: lambda.term && typeof lambda.term === 'object' ? lambda.term : (lambda && Object.keys(lambda).length ? lambda : { raw: String(lambda.error || '') }),
-    adapter_name: 'render-proof-convert',
+    adapter_name: executorName === 'github-actions' ? 'github-actions-proof-executor' : 'execution-server-proof-convert',
     adapter_meta: {
       planner: 'railway',
-      executor: 'render',
+      executor: executorName,
       planId: plan.id,
       operation: plan.operation,
       targetFamily: conversion.targetFamily || null,
@@ -1708,7 +2489,7 @@ function synthesizeJobFromPlan(plan, jobId = null) {
     startedAt: plan.startedAt || null,
     completedAt: plan.completedAt || null,
     progress: plan.progress || null,
-    result: status === JOB_STATUS.SUCCEEDED ? result : null,
+    result,
     error: status === JOB_STATUS.FAILED ? error : null,
     problemId: plan.problemId || null,
     planId: plan.id
@@ -1753,7 +2534,7 @@ async function persistJob(job) {
     verification_status: job.result ? resolveVerificationStatus(job.result) : null,
     source_sha256: job.sourceSha256 || null,
     progress: job.progress || {},
-    result: job.status === JOB_STATUS.SUCCEEDED ? (job.result || null) : null,
+    result: job.result || null,
     error: job.status === JOB_STATUS.FAILED ? (job.error || null) : null,
     problem_id: job.problemId || null,
     plan_id: job.planId || null,
