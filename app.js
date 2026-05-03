@@ -151,6 +151,17 @@ app.get('/', (_req, res) => {
   });
 });
 
+app.get('/healthz', (_req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: SERVICE_NAME,
+    version: SERVICE_VERSION,
+    supabaseConfigured: !!getSupabaseAdmin().client,
+    execution: getExecutionInfo(),
+    roles: getRoleInfo()
+  });
+});
+
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-store');
   if (!HELPER_API_KEY) {
@@ -170,17 +181,6 @@ app.use((req, res, next) => {
     return;
   }
   next();
-});
-
-app.get('/healthz', (_req, res) => {
-  res.status(200).json({
-    ok: true,
-    service: SERVICE_NAME,
-    version: SERVICE_VERSION,
-    supabaseConfigured: !!getSupabaseAdmin().client,
-    execution: getExecutionInfo(),
-    roles: getRoleInfo()
-  });
 });
 
 app.get('/api/helper/info', (_req, res) => {

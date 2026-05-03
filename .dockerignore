@@ -2,3 +2,5 @@
 .gitignore
 node_modules
 data
+deploy/gce/.env.runtime
+deploy/gce/runtime.env

@@ -1,6 +1,6 @@
-# Railway Helper Service
+# Helper Service
 
-Railway に載せる軽量 helper API です。
+常駐 helper API です。Railway でも Google Compute Engine でも動かせます。
 
 ## Role Split
 
@@ -146,6 +146,32 @@ These routes let the helper act like the old heavy execution server.
 - If `GITHUB_EXECUTION_ENABLED=true`, the helper dispatches GitHub Actions and waits up to `GITHUB_EXECUTION_SYNC_WAIT_TIMEOUT_MS` for completion before replying.
 - If GitHub execution is not enabled, the helper can still proxy to `EXECUTION_SERVER_BASE_URL`.
 - This makes it possible to point Vercel's `EXECUTION_API_BASE_URL` or `EXECUTION_SERVER_BASE_URL` at the helper service while keeping heavy execution off the Vercel runtime.
+
+## Google Compute Engine
+
+This helper can run on a small always-on Google Compute Engine VM instead of Railway.
+
+Added deployment assets:
+
+- `deploy/gce/compose.yaml`
+- `deploy/gce/runtime.env.example`
+- `deploy/gce/startup-script.sh`
+- `deploy/gce/create-instance.sh`
+- `deploy/gce/create-firewall-rule.sh`
+- `deploy/gce/README.md`
+
+Recommended GCE shape:
+
+- `e2-micro`
+- Ubuntu 22.04 LTS
+- static external IP
+- Docker on the host
+
+Recommended Vercel pairing:
+
+- `HELPER_API_BASE_URL=http://<gce-ip-or-domain>`
+- `HELPER_API_KEY=<same as helper>`
+- leave `EXECUTION_API_BASE_URL` unset so Vercel reuses the helper's compatibility routes
 
 ## Notes
 

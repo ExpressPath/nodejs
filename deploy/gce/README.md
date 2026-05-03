@@ -1,0 +1,103 @@
+# Google Compute Engine Deployment
+
+This folder prepares the helper service to run on a small always-on Compute Engine VM while GitHub Actions keeps handling heavy proof execution.
+
+## Files
+
+- `compose.yaml`
+  - runs the helper as a Docker container and exposes it publicly
+- `runtime.env.example`
+  - template for the VM runtime environment
+- `startup-script.sh`
+  - idempotent VM startup script that installs Docker, clones the repo, writes the env file from instance metadata, and starts the helper
+- `reserve-static-ip.sh`
+  - example `gcloud` wrapper for reserving a static external IP
+- `reserve-static-ip.ps1`
+  - PowerShell variant for reserving a static external IP on Windows
+- `create-instance.sh`
+  - example `gcloud` wrapper for creating the VM
+- `create-instance.ps1`
+  - PowerShell variant for creating the VM on Windows
+- `create-firewall-rule.sh`
+  - example `gcloud` wrapper for opening inbound HTTP
+- `create-firewall-rule.ps1`
+  - PowerShell variant for opening inbound HTTP on Windows
+
+## Recommended topology
+
+- `Vercel`
+  - serves the public app
+  - proxies helper and execution requests to the GCE helper
+- `Compute Engine`
+  - runs this helper container permanently
+  - owns the public URL used by `HELPER_API_BASE_URL`
+  - can expose `/healthz` for simple VM or load balancer health checks
+- `GitHub Actions`
+  - runs Lean / Coq proof checks
+  - runs typed-lambda conversion
+  - runs `cic-v1` conversion when the extra exporter dependencies are present
+
+## Minimal VM shape
+
+- machine type: `e2-micro` to start
+- boot disk: `20GB`
+- image: `ubuntu-2204-lts`
+- external static IP: recommended
+
+## Runtime env
+
+Copy `runtime.env.example` to `.env.runtime` or `runtime.env` and fill in:
+
+- `HELPER_API_KEY`
+- `HELPER_PUBLIC_BASE_URL`
+- `HELPER_ALLOWED_ORIGINS`
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `GITHUB_EXECUTION_TOKEN`
+- `GITHUB_EXECUTION_REPOSITORY`
+
+Do not commit the runtime env file. The repository ignores `deploy/gce/.env.runtime` and `deploy/gce/runtime.env`.
+
+## Create flow
+
+1. Reserve a static external IP for the VM.
+2. Create a firewall rule for inbound HTTP.
+3. Create the VM with `create-instance.sh`.
+4. Point `HELPER_PUBLIC_BASE_URL` at the VM URL.
+5. Set Vercel env:
+   - `HELPER_API_BASE_URL=http://<vm-ip-or-domain>`
+   - `HELPER_API_KEY=<same value as helper>`
+   - leave `EXECUTION_API_BASE_URL` unset if you want Vercel to reuse the helper's compatibility routes
+
+## Metadata contract
+
+The startup script reads these instance metadata keys:
+
+- `ivucx-helper-repo-url`
+- `ivucx-helper-repo-ref`
+- `ivucx-helper-env`
+
+`ivucx-helper-env` should contain the full `.env` file contents.
+
+## Windows-first example
+
+From PowerShell:
+
+```powershell
+Copy-Item deploy\gce\runtime.env.example deploy\gce\.env.runtime
+```
+
+Fill `deploy\gce\.env.runtime`, then run:
+
+```powershell
+.\deploy\gce\reserve-static-ip.ps1 -ProjectId YOUR_PROJECT -Region asia-northeast1
+.\deploy\gce\create-firewall-rule.ps1 -ProjectId YOUR_PROJECT
+.\deploy\gce\create-instance.ps1 -ProjectId YOUR_PROJECT -Zone asia-northeast1-a -InstanceName ivucx-helper -StaticIp ivucx-helper-ip
+```
+
+After the VM boots, point Vercel at:
+
+```text
+HELPER_API_BASE_URL=http://YOUR_STATIC_IP
+HELPER_API_KEY=<same value as helper>
+```

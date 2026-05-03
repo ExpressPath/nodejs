@@ -3,3 +3,5 @@ data/
 .env
 .env.local
 .env.*.local
+deploy/gce/.env.runtime
+deploy/gce/runtime.env
